@@ -1,0 +1,178 @@
+"""Shared outbound HTTP client. Every Réseau upstream call (GitHub, Linear, Graph8) goes through Client.
+
+Why (spikes/mcp_bridge/FINDINGS.md, "Cloudflare throttling and UA banning"): be.graph8.com answers bursts with
+HTTP 429 plus an HTML "Just a moment..." page, and bans library-default user-agents (403, error 1010). So every
+request gets an explicit User-Agent, a content-type check before parsing, backoff on 429/5xx, connect and read
+timeouts, and a per-host concurrency cap. Whether GitHub/Linear behave the same is unverified; all hosts get it.
+
+RETRY SCOPE: only idempotent reads (GET/HEAD/OPTIONS) and the MCP handshake (SAFE_MCP_METHODS) are retried by
+default. tools/call and any other call with side effects is NOT retried here; business-level retry is out of scope.
+Pass retry=True only when you know the call is safe to repeat.
+"""
+import http.client
+import json
+import logging
+import random
+import socket
+import threading
+import time
+import urllib.parse
+from collections import namedtuple
+from email.utils import parsedate_to_datetime
+
+log = logging.getLogger("reseau.http")
+
+# ponytail: starting constants, tune after the concurrency spike.
+USER_AGENT = "reseau-gateway/0.1"
+MAX_ATTEMPTS = 4
+BACKOFF_BASE = 0.5       # seconds; full jitter over base * 2**(attempt-1)
+BACKOFF_CAP = 8.0
+RETRY_AFTER_CAP = 30.0   # server asks for longer than this -> give up instead of stalling the agent turn
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = 60.0
+MAX_PER_HOST = 2
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS"}
+SAFE_MCP_METHODS = {"initialize", "notifications/initialized", "ping", "tools/list"}
+
+Response = namedtuple("Response", "status headers data")  # headers: lower-cased keys; data: parsed JSON or None
+
+
+class HttpError(Exception):
+    """kind: rate_limited | http | unexpected_content_type | bad_json | timeout | connection"""
+
+    def __init__(self, kind, url, status=None, content_type=None, snippet="", attempts=1):
+        self.kind, self.url, self.status, self.content_type = kind, url, status, content_type
+        self.snippet, self.attempts = snippet, attempts
+        super().__init__(str(self))
+
+    def __str__(self):
+        return "%s: %s status=%s content_type=%s attempts=%d %r" % (
+            self.kind, self.url, self.status, self.content_type, self.attempts, self.snippet)
+
+
+class RetryPolicy:
+    """Decides whether and how long to wait. Knows nothing about transport."""
+
+    def __init__(self, max_attempts=MAX_ATTEMPTS, base=BACKOFF_BASE, cap=BACKOFF_CAP,
+                 retry_after_cap=RETRY_AFTER_CAP, rand=random.random):
+        self.max_attempts, self.base, self.cap = max_attempts, base, cap
+        self.retry_after_cap, self.rand = retry_after_cap, rand
+
+    def delay(self, attempt, retry_after=None):
+        """Seconds to wait before the next attempt, or None to give up."""
+        if attempt >= self.max_attempts:
+            return None
+        if retry_after is not None:
+            return retry_after if retry_after <= self.retry_after_cap else None
+        return self.rand() * min(self.cap, self.base * 2 ** (attempt - 1))
+
+
+def http_transport(method, url, headers, body, connect_timeout, read_timeout):
+    """One raw exchange -> (status, lower-cased headers, body bytes). http.client adds no default User-Agent."""
+    u = urllib.parse.urlsplit(url)
+    cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    conn = cls(u.hostname, u.port, timeout=connect_timeout)
+    try:
+        conn.connect()
+        conn.sock.settimeout(read_timeout)
+        conn.request(method, (u.path or "/") + ("?" + u.query if u.query else ""), body=body, headers=headers)
+        r = conn.getresponse()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+    finally:
+        conn.close()
+
+
+def _snippet(raw):
+    return " ".join(raw[:400].decode("utf-8", "replace").split())[:200]
+
+
+def _parse_sse(text):
+    """Streamable HTTP SSE reply -> the JSON-RPC response message (last event if none carries result/error)."""
+    msgs = []
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        data = "\n".join(l[6:] if l.startswith("data: ") else l[5:] for l in block.split("\n") if l.startswith("data:"))
+        if data:
+            msgs.append(json.loads(data))
+    return next((m for m in msgs if isinstance(m, dict) and ("result" in m or "error" in m)), msgs[-1] if msgs else None)
+
+
+class Client:
+    def __init__(self, transport=http_transport, policy=None, sleep=time.sleep, clock=time.time,
+                 max_per_host=MAX_PER_HOST, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT,
+                 user_agent=USER_AGENT):
+        self.transport, self.policy = transport, policy or RetryPolicy()
+        self.sleep, self.clock, self.max_per_host = sleep, clock, max_per_host
+        self.connect_timeout, self.read_timeout, self.user_agent = connect_timeout, read_timeout, user_agent
+        self._lock, self._slots = threading.Lock(), {}
+
+    def _slot(self, host):
+        with self._lock:
+            return self._slots.setdefault(host, threading.BoundedSemaphore(self.max_per_host))
+
+    def _retry_after(self, value):
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            pass
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - self.clock())
+        except (TypeError, ValueError):
+            return None
+
+    def request(self, method, url, body=None, headers=None, retry=None):
+        """-> Response. Raises HttpError only; non-JSON bodies never surface as parse exceptions."""
+        method = method.upper()
+        retry = method in IDEMPOTENT_METHODS if retry is None else retry
+        headers = {"User-Agent": self.user_agent, "Accept": "application/json, text/event-stream", **(headers or {})}
+        host = urllib.parse.urlsplit(url).netloc
+        attempt = 0
+        while True:
+            attempt += 1
+            retry_after = None
+            try:
+                with self._slot(host):
+                    status, rh, raw = self.transport(method, url, headers, body, self.connect_timeout, self.read_timeout)
+            except (socket.timeout, TimeoutError) as e:
+                log.info("%s %s -> timeout (attempt %d)", method, url, attempt)
+                err = HttpError("timeout", url, snippet=str(e))
+            except (OSError, http.client.HTTPException) as e:
+                log.info("%s %s -> %s (attempt %d)", method, url, type(e).__name__, attempt)
+                err = HttpError("connection", url, snippet=str(e))
+            else:
+                log.info("%s %s -> %s (attempt %d)", method, url, status, attempt)
+                ct = rh.get("content-type", "").split(";")[0].strip().lower()
+                if 200 <= status < 300:
+                    return Response(status, rh, self._parse(url, status, ct, raw))
+                err = HttpError("rate_limited" if status == 429 else "http", url, status, ct, _snippet(raw))
+                if status not in RETRY_STATUSES:
+                    err.attempts = attempt
+                    raise err
+                retry_after = self._retry_after(rh.get("retry-after"))
+            wait = self.policy.delay(attempt, retry_after) if retry else None
+            if wait is None:
+                err.attempts = attempt
+                raise err
+            log.warning("retrying %s %s in %.2fs after %s", method, url, wait, err.kind)
+            self.sleep(wait)
+
+    def _parse(self, url, status, ct, raw):
+        if not raw.strip():
+            return None  # 202/204, e.g. notifications
+        try:
+            if ct == "application/json":
+                return json.loads(raw)
+            if ct == "text/event-stream":
+                return _parse_sse(raw.decode("utf-8"))
+        except ValueError:
+            raise HttpError("bad_json", url, status, ct, _snippet(raw)) from None
+        raise HttpError("unexpected_content_type", url, status, ct, _snippet(raw))
+
+    def rpc(self, url, payload, headers=None):
+        """MCP JSON-RPC POST. Only the handshake / listing methods are retried; tools/call never is."""
+        return self.request("POST", url, json.dumps(payload).encode(),
+                            {"Content-Type": "application/json", **(headers or {})},
+                            retry=payload.get("method") in SAFE_MCP_METHODS)
