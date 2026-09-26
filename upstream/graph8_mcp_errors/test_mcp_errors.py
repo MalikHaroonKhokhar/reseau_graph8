@@ -139,16 +139,18 @@ def test_sse_registration_of_streamable_only_server(streamable_only_url, caplog)
     assert result["message"] in caplog.text
 
 
-def test_stdio_process_that_is_not_an_mcp_server(caplog):
+@pytest.mark.parametrize("handler", ["test_server", "list_server_tools"])
+def test_stdio_failure_redacts_child_stderr(caplog, capfd, handler):
     caplog.set_level(logging.DEBUG, logger="mcp_errors")
     server = {"mcp_server_id": "uuid-3", "transport_type": "stdio", "command": "sh",
-              "args": ["-c", 'echo "$TOKEN" >&2; exit 0'], "env_vars": {"TOKEN": CANARY}}
-    result = anyio.run(mcp_errors.list_server_tools, server)
-    print("stdio sh:", result)
+              "args": ["-c", 'echo "boom: token=$TOKEN" >&2; exit 3'], "env_vars": {"TOKEN": CANARY}}
+    result = anyio.run(getattr(mcp_errors, handler), server)
+    out, err = capfd.readouterr()  # fd-level: catches what the child process writes, which caplog cannot see
 
-    assert result["success"] is False and "TaskGroup" not in result["message"]
-    _assert_no_canary(result["message"])
-    _assert_no_canary(caplog.text)
+    assert result["success"] is False
+    assert result["message"] == "McpError: Connection closed\nstderr: boom: token=***"
+    for text in (result["message"], caplog.text, out, err):
+        _assert_no_canary(text)
 
 
 STDIO_SERVER = """
