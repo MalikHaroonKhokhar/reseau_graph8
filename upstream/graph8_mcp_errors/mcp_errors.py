@@ -10,6 +10,10 @@ Graph8 route loads the registration and returns `{"data": <result>}`. Both
 handlers send failures through `describe_mcp_error`, so every message is
 unwrapped and redacted.
 
+Connect, initialize and tools/list share one deadline, `MCP_CONNECT_TIMEOUT`
+(HAR-88). A hung server gets `success: false` naming the phase, instead of
+holding the request open until Cloudflare returns 502.
+
 While a connection is open, every log record created in its task tree, including
 the MCP SDK's (some go to the root logger), is redacted by the log record
 factory installed below. That factory also drops `exc_info`, because the SDK's
@@ -22,6 +26,7 @@ import re
 import tempfile
 from typing import Iterable
 
+import anyio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
@@ -32,6 +37,10 @@ except NameError:  # Python 3.10: anyio installs the backport
     from exceptiongroup import BaseExceptionGroup
 
 logger = logging.getLogger(__name__)
+
+# Graph8's call. Keep it well below the Cloudflare origin timeout (100s by default); the SDK can
+# add ~2s after it while it terminates a stdio child.
+MCP_CONNECT_TIMEOUT = 30
 
 # httpx appends this to HTTPStatusError messages. It is noise, not diagnosis.
 _HTTPX_DOCS_SUFFIX = re.compile(r"\nFor more information check: https://developer\.mozilla\.org/\S*")
@@ -103,7 +112,7 @@ def _leaves(exc: BaseException):
         yield f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
-async def _fetch_tools(server: dict, errlog):
+async def _fetch_tools(server: dict, errlog, phase: list):
     if server["transport_type"] == "sse":
         client = sse_client(server["connection_url"])
     else:
@@ -112,7 +121,9 @@ async def _fetch_tools(server: dict, errlog):
             command=server["command"], args=server.get("args") or [], env=server.get("env_vars")), errlog=errlog)
     async with client as (read, write):
         async with ClientSession(read, write) as session:
+            phase[0] = "initialize"
             await session.initialize()
+            phase[0] = "tools/list"
             return (await session.list_tools()).tools
 
 
@@ -123,13 +134,15 @@ async def _connect(server: dict, action: str):
     try:
         # errors="replace": a child can write any bytes, and a decode error must not replace the real failure.
         with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errlog:
+            phase = ["connect"]
             try:
-                return await _fetch_tools(server, errlog), None
+                with anyio.move_on_after(MCP_CONNECT_TIMEOUT):
+                    return await _fetch_tools(server, errlog, phase), None
+                message = f"Timed out after {MCP_CONNECT_TIMEOUT}s during {phase[0]}"
             except Exception as exc:
-                error = exc  # Python unbinds `exc` when the except block ends
-                errlog.seek(0)
-                stderr = errlog.read()
-        message = describe_mcp_error(error, redact=secrets)
+                message = describe_mcp_error(exc, redact=secrets)
+            errlog.seek(0)
+            stderr = errlog.read()
         stderr = _redact(stderr, secrets).strip()
         if stderr:
             # ponytail: keeps only the last 2000 chars of stderr. Raise the limit if tracebacks get cut.

@@ -1,4 +1,4 @@
-"""Run: uv run --python 3.12 --with pytest --with "mcp<2" python -m pytest upstream/graph8_mcp_errors -q"""
+"""Run: uv run --python 3.12 --with pytest --with "mcp<2" --with uvicorn python -m pytest upstream/graph8_mcp_errors -q"""
 import contextlib
 import logging
 import socket
@@ -202,3 +202,47 @@ def test_working_server_still_succeeds(handler):
     result = anyio.run(getattr(mcp_errors, handler), server)
     assert result["success"] is True and result["message"] == "Connection successful"
     assert result.get("tools_count", 1) == 1 and [t["name"] for t in result.get("tools", [{"name": "ping"}])] == ["ping"]
+
+
+# --- HAR-88: a hung server fails within the timeout and names the phase ---
+
+# Answers initialize, then never answers tools/list.
+HANGS_ON_LIST = """
+import json, sys, time
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {
+    "protocolVersion": req["params"]["protocolVersion"], "capabilities": {"tools": {}},
+    "serverInfo": {"name": "hang", "version": "0"}}}), flush=True)
+time.sleep(100)
+"""
+
+
+@pytest.fixture(scope="module")
+def silent_tcp_url():
+    """Accepts connections and never sends a byte."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    conns = []
+    threading.Thread(target=lambda: conns.extend(iter(lambda: sock.accept()[0], None)), daemon=True).start()
+    yield f"http://127.0.0.1:{sock.getsockname()[1]}/sse"
+    sock.close()
+
+
+@pytest.mark.parametrize("handler", ["test_server", "list_server_tools"])
+@pytest.mark.parametrize("phase", ["connect", "initialize", "tools/list"])
+def test_hung_server_times_out_with_phase(monkeypatch, silent_tcp_url, handler, phase):
+    monkeypatch.setattr(mcp_errors, "MCP_CONNECT_TIMEOUT", 1)
+    server = {
+        "connect": {"transport_type": "sse", "connection_url": silent_tcp_url},
+        # The ticket's reproduction.
+        "initialize": {"transport_type": "stdio", "command": sys.executable, "args": ["-c", "import time; time.sleep(100)"]},
+        "tools/list": {"transport_type": "stdio", "command": sys.executable, "args": ["-c", HANGS_ON_LIST]},
+    }[phase]
+    start = time.monotonic()
+    result = anyio.run(getattr(mcp_errors, handler), server)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1 + 3  # timeout plus the SDK's 2s child-termination grace
+    assert result["success"] is False
+    assert result["message"] == f"Timed out after 1s during {phase}"
