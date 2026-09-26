@@ -8,7 +8,7 @@ Reads GRAPH8_API_KEY / GRAPH8_API_URL from the repo-root .env. Read-only, serial
 Output files and stdout carry keys, types, tool names and error codes only, never record values.
 Exit 0 only when every entity has a qualifying sample; an empty org is reported as EMPTY, not success.
 """
-import json, os, re, sys, time
+import json, os, re, sys, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "mcp_bridge"))
@@ -23,8 +23,8 @@ def is_commitment(task):
         return True
     if task.get("company_id") is not None:
         return True
-    # ponytail: link dict shape is unverified (no linked task seen yet); adjust once one is.
-    return any((l.get("entity_type") or l.get("type")) in BIZ and (l.get("entity_id") or l.get("id"))
+    # links[] shape verified 2026-09-26: {entity_type, entity_id, entity_label, canonical_entity_id, available}
+    return any(l.get("entity_type") in BIZ and l.get("entity_id")
                for l in task.get("links") or [])
 
 
@@ -73,9 +73,38 @@ def call(url, key, rid, name, args):
     if status != 200 or not res or res.get("isError"):
         raise ProbeError(safe_error(name, status, msg))
     try:
-        return res.get("structuredContent") or json.loads("".join(c.get("text", "") for c in res["content"]))
+        out = res.get("structuredContent") or json.loads("".join(c.get("text", "") for c in res["content"]))
     except ValueError:
         raise ProbeError("%s -> unparseable result" % name)
+    # Some tools report failure as a plain "Error: ..." result with isError unset (seen on g8_get_contact_detail).
+    if isinstance(out, dict) and isinstance(out.get("result"), str) and out["result"].startswith("Error"):
+        raise ProbeError("%s -> tool error result" % name)
+    return out
+
+
+def rest(key, method, path, body=None):
+    """REST call on be.graph8.com/api/v1, for routes with no MCP tool. Returns (status, json|None)."""
+    time.sleep(PAUSE)
+    req = urllib.request.Request("https://be.graph8.com/api/v1" + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                                          "User-Agent": "reseau-entity-probe/1"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or "null")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+def correspondence(key, company_ids):
+    """Account correspondence (email/linkedin/call_notes logged on a company). REST only: no MCP tool."""
+    for cid in company_ids:
+        status, body = rest(key, "GET", "/accounts/%s/correspondence" % cid)
+        rows = (body or {}).get("data") if status == 200 else None
+        rows = rows.get("items", rows) if isinstance(rows, dict) else rows
+        if rows:
+            return status, rows
+    return None, []
 
 
 def discover(url, key, rid):
@@ -111,6 +140,7 @@ def selftest():
     assert is_commitment({"entity_type": "deal", "entity_id": "d1"})
     assert is_commitment({"company_id": 42})
     assert is_commitment({"links": [{"entity_type": "company", "entity_id": "42"}]})
+    assert not is_commitment({"links": [{"type": "deal", "id": "d1"}]})  # not the verified shape
     assert not is_commitment({"links": [{"entity_type": "deal"}]})
     assert not is_commitment({"links": [{"entity_type": "deal", "entity_id": ""}]})
     leak = {"error": {"code": -32000, "message": "Acme Corp jane@acme.com"}}
@@ -135,7 +165,7 @@ def main():
     m.notify(url, key, None, "notifications/initialized")
     call(url, key, 2, "g8_current_org", {})  # org-context gate (-32003 otherwise)
 
-    shapes, ok, rid = {}, True, 10
+    shapes, ok, rid, seen = {}, True, 10, {}
     for entity, tools in ENTITIES.items():
         got = False
         for name, args, list_key, qualifies in tools:
@@ -151,6 +181,14 @@ def main():
             print("%-12s %-22s %s (total=%s, scanned=%d, qualifying=%d)" % (entity, name, state, res.get("total"), len(rows), len(good)))
             shapes[name] = shape(good[0]) if good else None
             got = got or bool(good)
+            seen[name] = good
+        if entity == "conversation":
+            # Correspondence hangs off the account, so look at the companies of the sampled deals.
+            cids = sorted({d["company_id"] for d in seen.get("g8_get_deals", []) if d.get("company_id") is not None})[:5]
+            status, rows = correspondence(key, cids)
+            print("%-12s %-22s %s (accounts checked=%d, rows=%d)" % (entity, "REST correspondence", "SAMPLE" if rows else "EMPTY", len(cids), len(rows)))
+            shapes["rest:/accounts/{company_id}/correspondence"] = shape(rows[0]) if rows else None
+            got = got or bool(rows)
         ok = ok and got
 
     # Linkage check: commitments whose source_url points at a Linear issue or GitHub PR/commit.
