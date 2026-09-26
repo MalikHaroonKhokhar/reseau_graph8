@@ -153,6 +153,37 @@ def test_stdio_failure_redacts_child_stderr(caplog, capfd, handler):
         _assert_no_canary(text)
 
 
+LONG_TOKEN = "tok_" + "0123456789abcdef" * 4  # over 50 chars, so pydantic truncates it in its error
+
+
+@pytest.mark.parametrize("secret", [CANARY, LONG_TOKEN], ids=["multiline", "truncated"])
+def test_sdk_parse_error_logs_are_redacted(caplog, capfd, secret):
+    caplog.set_level(logging.DEBUG)
+    server = {"mcp_server_id": "uuid-4", "transport_type": "stdio", "command": "sh",
+              "args": ["-c", 'printf "%s\\n" "$TOKEN"; exit 0'], "env_vars": {"TOKEN": secret}}
+    result = anyio.run(mcp_errors.test_server, server)
+    out, err = capfd.readouterr()
+
+    assert result["success"] is False
+    assert "Failed to parse JSONRPC message from server" in caplog.text  # the SDK path under test ran
+    assert all(r.exc_info is None for r in caplog.records)
+    for text in (result["message"], caplog.text, out, err):
+        _assert_no_canary(text)
+        assert "0123456789" not in text
+
+
+def test_non_utf8_stderr_still_reports_failure():
+    server = {"transport_type": "stdio", "command": "sh", "args": ["-c", "printf '\\377boom\\n' >&2; exit 1"]}
+    result = anyio.run(mcp_errors.test_server, server)
+    assert result == {"success": False, "message": "McpError: Connection closed\nstderr: \ufffdboom", "tools_count": None}
+
+
+def test_redaction_is_scoped_to_the_connection(caplog):
+    caplog.set_level(logging.INFO)
+    logging.getLogger("elsewhere").info("tok_0123456789abcdef is fine here")
+    assert "tok_0123456789abcdef" in caplog.text
+
+
 STDIO_SERVER = """
 from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("ok")
