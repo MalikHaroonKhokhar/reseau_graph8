@@ -2,7 +2,8 @@
 """HAR-107: seed / clean up synthetic Graph8 records so entity_probe.py can reach Green.
 
 Usage: python3 seed_fixture.py seed      # contact+company, deal, deal-linked task, account correspondence
-       python3 seed_fixture.py cleanup   # delete everything recorded in seed_state.json, then verify
+       python3 seed_fixture.py cleanup   # delete everything in seed_state.json; an id leaves the file only once verified gone
+       python3 seed_fixture.py selftest  # offline check of the cleanup bookkeeping
 WRITES to the live org. Internal writes only: nothing here sends email/SMS/LinkedIn, books a
 meeting or sends a calendar invite (those are the only ways to create inbox threads or meetings).
 All records are synthetic (reserved .example domain); created ids go to seed_state.json (gitignored).
@@ -74,39 +75,85 @@ def seed(url, key):
     print("correspond.", s, state["correspondence_id"], "keys:", sorted(data))
 
 
-def cleanup(url, key):
-    state = json.load(open(STATE))
-    steps = [
-        ("correspondence_id", lambda: p.rest(key, "DELETE", "/accounts/%s/correspondence/%s" % (state["company_id"], state["correspondence_id"]))[0]),
-        ("task_id", lambda: p.call(url, key, 20, "g8_delete_task", {"task_id": state["task_id"]}) and 200),
-        ("deal_id", lambda: p.call(url, key, 21, "g8_delete_deal", {"deal_id": state["deal_id"]}) and 200),
-        ("contact_id", lambda: p.call(url, key, 22, "g8_execute", {"tool_name": "g8_crm_delete_contact",
-                                                                    "arguments": {"contact_id": state["contact_id"], "confirm": True}})["ok"] and 200),
-        ("company_id", lambda: p.call(url, key, 23, "g8_execute", {"tool_name": "g8_crm_delete_company",
-                                                                    "arguments": {"company_id": state["company_id"], "confirm": True}})["ok"] and 200),
-    ]
-    for k, fn in steps:
+# Deleted children before the company: correspondence is addressed through it.
+ORDER = ["correspondence_id", "task_id", "deal_id", "contact_id", "company_id"]
+
+
+def sweep(state, delete, gone, persist):
+    """Delete each recorded id, dropping it from state only once `gone` confirms it. Returns ids left."""
+    for k in ORDER:
         if state.get(k) is None:
             continue
+        if k == "company_id" and any(state.get(c) is not None for c in ORDER[:-1]):
+            print("delete %-18s -> SKIPPED, children still present" % k)
+            continue
         try:
-            print("delete %-18s -> %s" % (k, fn()))
+            print("delete %-18s -> %s" % (k, delete(k, state)))
         except p.ProbeError as e:
             print("delete %-18s -> FAILED %s" % (k, e))
+        if gone(k, state):
+            state.pop(k)
+            persist(state)
+        else:
+            print("verify %-18s -> STILL PRESENT, kept in seed_state.json" % k)
+    return [k for k in ORDER if state.get(k) is not None]
 
-    # Verify: nothing seeded is still readable.
-    left = p.call(url, key, 30, "g8_search_companies", {"domain": DOMAIN})["result"]["companies"]
-    deals = p.call(url, key, 31, "g8_get_deals", {"search": "reseau-probe"})["result"]["deals"]
-    tasks = p.call(url, key, 32, "g8_get_tasks", {"search": "reseau-probe"})["result"]["tasks"]
-    print("remaining: companies=%d deals=%d tasks=%d" % (len(left), len(deals), len(tasks)))
-    if not (left or deals or tasks):
-        os.remove(STATE)
-        print("clean; removed seed_state.json")
-        return 0
-    return 1
+
+def cleanup(url, key):
+    state = json.load(open(STATE))
+    mcp_delete = {
+        "task_id": lambda s: p.call(url, key, 20, "g8_delete_task", {"task_id": s["task_id"]}),
+        "deal_id": lambda s: p.call(url, key, 21, "g8_delete_deal", {"deal_id": s["deal_id"]}),
+        "contact_id": lambda s: p.call(url, key, 22, "g8_execute", {"tool_name": "g8_crm_delete_contact",
+                                        "arguments": {"contact_id": s["contact_id"], "confirm": True}}).get("ok"),
+        "company_id": lambda s: p.call(url, key, 23, "g8_execute", {"tool_name": "g8_crm_delete_company",
+                                        "arguments": {"company_id": s["company_id"], "confirm": True}}).get("ok"),
+    }
+
+    def delete(k, s):
+        if k == "correspondence_id":
+            return p.rest(key, "DELETE", "/accounts/%s/correspondence/%s" % (s["company_id"], s[k]))[0]
+        return mcp_delete[k](s)
+
+    def gone(k, s):
+        """Positive evidence only: a 404 on the record, or absence from a successful 200 listing."""
+        if k == "correspondence_id":
+            status, body = p.rest(key, "GET", "/accounts/%s/correspondence" % s["company_id"])
+            items = ((body or {}).get("data") or {}).get("items") if status == 200 else None
+            return status == 404 or (items is not None and all(i.get("id") != s[k] for i in items))
+        path = {"task_id": "/tasks/%s", "deal_id": "/deals/%s", "contact_id": "/contacts/%s", "company_id": "/companies/%s"}[k]
+        return p.rest(key, "GET", path % s[k])[0] == 404
+
+    left = sweep(state, delete, gone, save)
+    if left:
+        print("NOT clean; still present: %s (ids kept in seed_state.json, re-run cleanup)" % ", ".join(left))
+        return 1
+    os.remove(STATE)
+    print("clean: every seeded id verified gone; removed seed_state.json")
+    return 0
+
+
+def selftest():
+    saved = []
+    st = {k: "x" for k in ORDER}
+    def delete(k, s):
+        if k == "contact_id":
+            raise p.ProbeError("g8_execute -> HTTP 500 code=None")
+        return 200
+    left = sweep(st, delete, lambda k, s: k != "contact_id", lambda s: saved.append(dict(s)))
+    assert left == ["contact_id", "company_id"], left           # contact failed, so company must not be deleted
+    assert st == {"contact_id": "x", "company_id": "x"}, st      # retry still has both ids
+    left = sweep(st, lambda k, s: 200, lambda k, s: True, lambda s: saved.append(dict(s)))
+    assert left == [] and st == {} and saved[-1] == {}
+    st = {"task_id": "t"}                                        # delete "succeeds" but record still readable
+    assert sweep(st, lambda k, s: 200, lambda k, s: False, lambda s: None) == ["task_id"]
+    print("selftest ok")
 
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "selftest":
+        sys.exit(selftest())
     if cmd not in ("seed", "cleanup"):
         sys.exit(__doc__)
     url, key = session()

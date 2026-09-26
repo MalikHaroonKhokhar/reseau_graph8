@@ -16,7 +16,7 @@ Re-run:
   - Against the org as it is today (no deals, tasks or conversations), it is Red.
 - `--discover` also writes `discovery.json`: the full tool catalog, the entity output-field lists, the term-search hits and the key scopes. This is the retained evidence behind every "not found" below.
 - `--selftest` runs the offline checks (scrubbing and the commitment rule).
-- `python3 seed_fixture.py seed` then `cleanup` **writes to the live org**. It makes internal writes only; nothing is sent. It creates a contact on `reseau-probe.example`, which also creates the company, then a deal, a deal-linked task with `source_url` = the HAR-107 Linear URL, and a correspondence record. Created IDs go to `seed_state.json` (gitignored), so cleanup can be re-run. Cleanup verifies that nothing remains.
+- `python3 seed_fixture.py seed` then `cleanup` **writes to the live org**. It makes internal writes only; nothing is sent. It creates a contact on `reseau-probe.example`, which also creates the company, then a deal, a deal-linked task with `source_url` = the HAR-107 Linear URL, and a correspondence record. Created IDs go to `seed_state.json` (gitignored). Cleanup removes an ID from that file only after it is **verified gone**: a REST `GET` on the record returns 404 (confirmed for tasks, deals, contacts and companies), or the ID is absent from a 200 correspondence listing. The company is deleted last, and only once no child records remain. Any failure keeps the IDs and exits 1, so cleanup can be re-run. `seed_fixture.py selftest` checks this bookkeeping offline.
 
 Output files and stdout carry keys, types, tool names and error codes only. Errors print `tool -> HTTP status code=<JSON-RPC code>` and never the server's message text.
 
