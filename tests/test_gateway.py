@@ -293,3 +293,76 @@ def test_health_tracks_availability_failure_and_recovery(mocks):
     assert during["github"]["ok"] is False and during["github"]["error"]["kind"] == "unavailable"
     assert during["linear"] == {"ok": True, "error": None}
     assert after["github"] == {"ok": True, "error": None}
+
+
+# ---- Graph8 org-context gate (HAR-92) ----
+
+G8_TOKEN = "g8_live_secret_q1w2e3"
+G8_ENV = {"GRAPH8_API_KEY": G8_TOKEN}
+
+
+def graph8(mock, bootstrap=True):
+    extra = ("g8_current_org", -32003) if bootstrap else ()
+    return [Upstream("graph8", mock.url, "GRAPH8_API_KEY", *extra)]
+
+
+def test_default_graph8_upstream_bootstraps_org():
+    from reseau.gateway import DEFAULT_UPSTREAMS
+    g8 = {u.name: u for u in DEFAULT_UPSTREAMS}["graph8"]
+    assert (g8.token_env, g8.bootstrap_tool, g8.gate_code) == ("GRAPH8_API_KEY", "g8_current_org", -32003)
+
+
+def test_red_org_gate_without_bootstrap_fails():
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8, bootstrap=False), G8_ENV) as gw:
+                with pytest.raises(MCPError) as e:
+                    await gw.call_tool("graph8", "echo", {"text": "x"})
+                return e.value
+
+    assert run(go()).code == -32003
+
+
+def test_green_first_call_bootstraps_once(caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                a = await gw.call_tool("graph8", "echo", {"text": "a"})
+                b = await gw.call_tool("graph8", "echo", {"text": "b"})
+                return a.content[0].text, b.content[0].text, g8.org_calls
+
+    assert run(go()) == ("echo:a", "echo:b", 1)
+    assert G8_TOKEN not in caplog.text
+
+
+def test_gate_mid_session_reestablishes_once_and_retries():
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                await gw.call_tool("graph8", "echo", {"text": "a"})
+                g8.org_ready = False  # server dropped the org context
+                res = await gw.call_tool("graph8", "echo", {"text": "b"})
+                return res.content[0].text, g8.org_calls
+
+    assert run(go()) == ("echo:b", 2)
+
+
+def test_persistent_gate_is_structured_error_without_loop(caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                await gw.call_tool("graph8", "echo", {"text": "a"})
+                g8.org_calls, g8.org_stuck = 0, True
+                with pytest.raises(UpstreamError) as e:
+                    await gw.call_tool("graph8", "echo", {"text": "b"})
+                return e.value, g8.org_calls
+
+    err, calls = run(go())
+    assert err.code == -32005
+    assert err.data == {"upstream": "graph8", "kind": "context_not_established"}
+    assert calls == 1  # exactly one re-establish, then give up
+    assert G8_TOKEN not in err.message and G8_TOKEN not in caplog.text

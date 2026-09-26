@@ -10,14 +10,30 @@ from mcp.shared.exceptions import MCPError
 
 
 class MockUpstream:
-    def __init__(self, token, stateless):
+    def __init__(self, token, stateless, org_gate=False):
         self.token = token
+        self.org_ready = not org_gate  # Graph8-style gate: tools fail -32003 until g8_current_org is called
+        self.org_calls = 0
+        self.org_stuck = False  # gate keeps failing even after g8_current_org
         self.fail_status = None  # set to e.g. 503 to fail every request after auth
         self.seen = []  # (method, headers dict) of every request that passed auth
         server = MCPServer("mock-" + ("stateless" if stateless else "stateful"))
 
+        def gate_check():
+            if not self.org_ready or self.org_stuck:
+                raise MCPError(-32003, "Org context not established for this session. Call g8_current_org first")
+
+        def g8_current_org() -> str:
+            self.org_calls += 1
+            self.org_ready = True
+            return "org"
+
+        if org_gate:
+            server.tool()(g8_current_org)
+
         @server.tool()
         def echo(text: str) -> str:
+            gate_check()
             return "echo:" + text
 
         @server.tool()

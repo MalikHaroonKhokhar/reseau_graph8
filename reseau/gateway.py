@@ -32,6 +32,10 @@ MISSING_CREDENTIAL = -32001
 UNAUTHORIZED = -32002
 UPSTREAM_UNAVAILABLE = -32003
 UNKNOWN_UPSTREAM = -32004
+CONTEXT_NOT_ESTABLISHED = -32005
+# Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
+# Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
+GRAPH8_ORG_GATE = -32003
 
 
 @dataclass(frozen=True)
@@ -39,11 +43,16 @@ class Upstream:
     name: str
     url: str
     token_env: str  # name of the env var holding the bearer token, never the token itself
+    # Tool that establishes per-key server context, called before the first tool call and once more on
+    # gate_code. Graph8 tracks org context by API key, with no Mcp-Session-Id to resume it (FINDINGS.md).
+    bootstrap_tool: str | None = None
+    gate_code: int | None = None
 
 
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/", "GITHUB_MCP_TOKEN"),
     Upstream("linear", "https://mcp.linear.app/mcp", "LINEAR_API_KEY"),
+    Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE),
 )
 
 
@@ -153,6 +162,7 @@ class _Conn:
         self.client = None
         self.error = None
         self.last_status = None
+        self.bootstrapped = False
         self.stop = self.done = None
 
     async def on_response(self, response):
@@ -203,6 +213,7 @@ class Gateway:
 
     async def _own(self, c, *, task_status):
         c.error, c.last_status, c.stop, c.done = None, None, anyio.Event(), anyio.Event()
+        c.bootstrapped = False
         started = False
         try:
             token = resolve_credential(c.upstream, self.env)
@@ -284,7 +295,34 @@ class Gateway:
         return [scrub_model(t, self.secrets) for t in await self._use(name, op)]
 
     async def call_tool(self, name, tool, arguments=None):
-        return scrub_model(await self._use(name, lambda client: client.call_tool(tool, arguments or {})), self.secrets)
+        c = self._conn(name)
+        up = c.upstream
+
+        async def bootstrap(client):
+            await client.call_tool(up.bootstrap_tool, {})
+            c.bootstrapped = True
+
+        async def op(client):
+            args = arguments or {}
+            if up.bootstrap_tool and not c.bootstrapped:
+                # ponytail: concurrent first calls may each bootstrap; harmless, it's idempotent and cheap.
+                await bootstrap(client)
+            try:
+                return await client.call_tool(tool, args)
+            except MCPError as exc:
+                if not up.bootstrap_tool or exc.code != up.gate_code:
+                    raise
+            await bootstrap(client)  # context lost mid-session: re-establish once, retry once, never loop
+            try:
+                return await client.call_tool(tool, args)
+            except MCPError as exc:
+                if exc.code != up.gate_code:
+                    raise
+            c.bootstrapped = False
+            raise UpstreamError(CONTEXT_NOT_ESTABLISHED, "%s: context still not established after %s; not retrying"
+                                % (name, up.bootstrap_tool), name, "context_not_established")
+
+        return scrub_model(await self._use(name, op), self.secrets)
 
 
 if __name__ == "__main__":
@@ -293,7 +331,7 @@ if __name__ == "__main__":
 
     async def smoke():
         async with Gateway() as gw:
-            for name, tool in (("github", "get_me"), ("linear", "list_teams")):
+            for name, tool in (("github", "get_me"), ("linear", "list_teams"), ("graph8", "g8_current_org")):
                 try:
                     tools = await gw.list_tools(name)
                     res = await gw.call_tool(name, tool)
