@@ -97,32 +97,50 @@ def scrub_error(err, secrets):
     return MCPError(err.code, redact(err.message, secrets), scrub(err.data, secrets))
 
 
-SECRETS = set()  # every token any Gateway has resolved; read by the log record factory below
+SECRETS = set()  # every token any Gateway has resolved; read by the log redaction below
 _log_redaction_installed = False
 
 
+def _scrub_record(record, secrets):
+    record.msg, record.args = redact(record.getMessage(), secrets), None
+    if record.exc_info:
+        # Pre-format so handlers use exc_text; drop exc_info so no formatter re-renders the raw exception.
+        record.exc_text = redact(logging.Formatter().formatException(record.exc_info), secrets)
+        record.exc_info = None
+    # Everything else on the record, including `extra` fields, stack_info and non-string objects a
+    # formatter would str() (e.g. %(authorization)s).
+    for key, value in list(vars(record).items()):
+        if value is None or isinstance(value, (bool, int, float)):
+            continue
+        if isinstance(value, (str, dict, list, tuple)):
+            clean = scrub(value, secrets)
+            changed = clean != (list(value) if isinstance(value, tuple) else value)
+        else:
+            text = str(value)
+            clean = redact(text, secrets)
+            changed = clean != text
+        if changed:
+            setattr(record, key, clean)
+
+
 def install_log_redaction(secrets=SECRETS):
-    """Redact secrets from every log record in the process, including formatted tracebacks and stack info.
-    Done at record creation (not as a handler filter) so it covers every logger and handler, present or
-    added later, including the SDK's and httpx's. Idempotent."""
+    """Redact secrets from every log record in the process: message, formatted traceback, stack info and
+    `extra` fields. Wraps Logger.makeRecord, the one point that sees a record after `extra` is attached
+    (the record factory runs before it), and applies to every logger and handler, present or added later,
+    including the SDK's and httpx's. Idempotent.
+    ponytail: a Logger subclass that overrides makeRecord bypasses this; wrap it too if one shows up."""
     global _log_redaction_installed
     if _log_redaction_installed:
         return
-    previous = logging.getLogRecordFactory()
+    original = logging.Logger.makeRecord
 
-    def factory(*args, **kwargs):
-        record = previous(*args, **kwargs)
+    def make_record(self, *args, **kwargs):
+        record = original(self, *args, **kwargs)
         if secrets:
-            record.msg, record.args = redact(record.getMessage(), secrets), None
-            if record.exc_info:
-                # Pre-format so handlers use exc_text; drop exc_info so no formatter re-renders the raw exception.
-                record.exc_text = redact(logging.Formatter().formatException(record.exc_info), secrets)
-                record.exc_info = None
-            if record.stack_info:
-                record.stack_info = redact(record.stack_info, secrets)
+            _scrub_record(record, secrets)
         return record
 
-    logging.setLogRecordFactory(factory)
+    logging.Logger.makeRecord = make_record
     _log_redaction_installed = True
 
 

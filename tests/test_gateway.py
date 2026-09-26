@@ -46,9 +46,9 @@ def test_scrub_nested():
 
 def test_gateway_installs_log_redaction():
     # Fresh interpreter: the process-wide record factory must come from constructing a Gateway alone.
-    code = ("import logging, reseau.gateway as g; f = logging.getLogRecordFactory(); g.Gateway([], {}); "
-            "g.SECRETS.add('tok_x'); r = logging.getLogger('sdk').makeRecord('sdk', 10, 'f', 1, 'Bearer %s', ('tok_x',), None); "
-            "assert logging.getLogRecordFactory() is not f and r.getMessage() == 'Bearer [REDACTED]', r.getMessage()")
+    code = ("import logging, reseau.gateway as g; g.Gateway([], {}); g.SECRETS.add('tok_x'); "
+            "r = logging.getLogger('sdk').makeRecord('sdk', 10, 'f', 1, 'Bearer %s', ('tok_x',), None, extra={'h': 'tok_x'}); "
+            "assert (r.getMessage(), r.h) == ('Bearer [REDACTED]', '[REDACTED]'), vars(r)")
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
@@ -78,6 +78,29 @@ def test_log_redaction_covers_messages_and_tracebacks():
     assert records[0].exc_info is None  # raw exception not left for a formatter that ignores exc_text
     assert GH_TOKEN not in out
     assert "[REDACTED]" in out and "RuntimeError" in out  # traceback still rendered, just scrubbed
+
+
+def test_log_redaction_covers_extra_fields():
+    install_log_redaction()
+    SECRETS.add(GH_TOKEN)
+
+    class Header:  # non-string extra that a formatter would str()
+        def __str__(self):
+            return "Bearer " + GH_TOKEN
+
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(message)s auth=%(authorization)s obj=%(obj)s meta=%(meta)s"))
+    logger = logging.getLogger("test.redact.extra")
+    logger.addHandler(handler)
+    try:
+        logger.warning("request", extra={"authorization": "Bearer " + GH_TOKEN, "obj": Header(),
+                                         "meta": {"headers": {"Authorization": "Bearer " + GH_TOKEN}}})
+    finally:
+        logger.removeHandler(handler)
+    out = buf.getvalue()
+    assert GH_TOKEN not in out
+    assert out.count("[REDACTED]") == 3
 
 
 # ---- integration (loopback mocks, no network) ----
