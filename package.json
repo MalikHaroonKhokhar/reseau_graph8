@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@graph8/sdk": "^0.245.0"
+  }
+}
