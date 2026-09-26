@@ -5,10 +5,12 @@ import socket
 import subprocess
 import sys
 
+import anyio
 import pytest
 
 from mcp.shared.exceptions import MCPError
 
+from reseau import gateway, outbound
 from reseau.gateway import (SECRETS, Gateway, Upstream, UpstreamError, build_headers, install_log_redaction,
                             redact, resolve_credential, scrub)
 from tests.mock_upstream import MockUpstream
@@ -105,6 +107,11 @@ def test_log_redaction_covers_extra_fields():
 
 # ---- integration (loopback mocks, no network) ----
 
+@pytest.fixture(autouse=True)
+def fast_backoff(monkeypatch):
+    monkeypatch.setattr(gateway, "RETRY_POLICY", outbound.RetryPolicy(base=0.01, cap=0.02))
+
+
 @pytest.fixture
 def mocks():
     with MockUpstream(GH_TOKEN, stateless=False) as gh, MockUpstream(LIN_TOKEN, stateless=True) as lin:
@@ -140,7 +147,7 @@ def test_green_both_upstreams_list_and_call(mocks, caplog):
     caplog.set_level(logging.DEBUG)
     health, out = run(go())
     assert health == {"github": {"ok": True, "error": None}, "linear": {"ok": True, "error": None}}
-    names = ["echo", "echo_struct", "rpc_fail"]
+    names = ["echo", "slow", "echo_struct", "rpc_fail"]
     assert out == {"github": (names, "echo:github"), "linear": (names, "echo:linear")}
     # session id carried only when issued: stateful mock gets it after initialize, stateless never does
     assert any("mcp-session-id" in h for _, h in gh.seen)
@@ -366,3 +373,70 @@ def test_persistent_gate_is_structured_error_without_loop(caplog):
     assert err.data == {"upstream": "graph8", "kind": "context_not_established"}
     assert calls == 1  # exactly one re-establish, then give up
     assert G8_TOKEN not in err.message and G8_TOKEN not in caplog.text
+
+
+def test_concurrent_first_calls_bootstrap_once():
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                out = []
+
+                async def call(i):
+                    out.append((await gw.call_tool("graph8", "echo", {"text": str(i)})).content[0].text)
+
+                async with anyio.create_task_group() as tg:
+                    for i in range(5):
+                        tg.start_soon(call, i)
+                return sorted(out), g8.org_calls
+
+    assert run(go()) == (["echo:%d" % i for i in range(5)], 1)
+
+
+# ---- shared HTTP reliability (outbound.py policy) through the gateway ----
+
+def test_429_html_on_connect_and_bootstrap_is_retried():
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            g8.fail_status, g8.fail_times = 429, 2  # burst during initialize
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                g8.fail_status, g8.fail_times = 429, 1  # next request is the g8_current_org bootstrap
+                res = await gw.call_tool("graph8", "echo", {"text": "a"})
+                return res.content[0].text, g8.org_calls, gw.health()
+
+    text, org_calls, health = run(go())
+    assert (text, org_calls) == ("echo:a", 1)
+    assert health["graph8"] == {"ok": True, "error": None}
+
+
+def test_429_on_tool_call_is_not_retried_and_is_structured(caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True) as g8:
+            async with Gateway(graph8(g8), G8_ENV) as gw:
+                await gw.call_tool("graph8", "echo", {"text": "a"})
+                g8.fail_status, g8.fail_times = 429, 2
+                with pytest.raises(UpstreamError) as e:
+                    await gw.call_tool("graph8", "echo", {"text": "side effect"})
+                left = g8.fail_times  # 1 left: the tools/call was sent exactly once
+                g8.fail_status = g8.fail_times = None
+                res = await gw.call_tool("graph8", "echo", {"text": "b"})
+                return e.value, left, res.content[0].text
+
+    err, left, text = run(go())
+    assert err.data == {"upstream": "graph8", "kind": "rate_limited"}
+    assert left == 1
+    assert text == "echo:b"
+    assert G8_TOKEN not in caplog.text
+
+
+def test_per_host_concurrency_cap():
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True) as g8:
+            async with Gateway(graph8(g8, bootstrap=False), G8_ENV) as gw:
+                async with anyio.create_task_group() as tg:
+                    for i in range(5):
+                        tg.start_soon(gw.call_tool, "graph8", "slow", {"text": str(i)})
+                return g8.peak
+
+    assert run(go()) == outbound.MAX_PER_HOST

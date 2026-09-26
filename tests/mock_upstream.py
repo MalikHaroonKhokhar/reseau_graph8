@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 
+import anyio
 import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.shared.exceptions import MCPError
@@ -15,7 +16,9 @@ class MockUpstream:
         self.org_ready = not org_gate  # Graph8-style gate: tools fail -32003 until g8_current_org is called
         self.org_calls = 0
         self.org_stuck = False  # gate keeps failing even after g8_current_org
-        self.fail_status = None  # set to e.g. 503 to fail every request after auth
+        self.fail_status = None  # set to e.g. 503 to fail requests after auth
+        self.fail_times = None  # with fail_status: fail only the next N requests (None = every request)
+        self.in_flight = self.peak = 0  # concurrent `slow` tool executions
         self.seen = []  # (method, headers dict) of every request that passed auth
         server = MCPServer("mock-" + ("stateless" if stateless else "stateful"))
 
@@ -37,6 +40,16 @@ class MockUpstream:
             return "echo:" + text
 
         @server.tool()
+        async def slow(text: str) -> str:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            try:
+                await anyio.sleep(0.2)
+            finally:
+                self.in_flight -= 1
+            return "slow:" + text
+
+        @server.tool()
         def echo_struct(text: str) -> dict[str, str]:
             return {"text": text}
 
@@ -55,8 +68,15 @@ class MockUpstream:
                     await send({"type": "http.response.body", "body": b"unauthorized"})
                     return
                 if self.fail_status:
-                    await send({"type": "http.response.start", "status": self.fail_status, "headers": []})
-                    await send({"type": "http.response.body", "body": b"unavailable"})
+                    status = self.fail_status
+                    if self.fail_times is not None:
+                        self.fail_times -= 1
+                        if self.fail_times <= 0:
+                            self.fail_status = self.fail_times = None
+                    # Cloudflare-style: 429 answered with an HTML challenge page, not JSON
+                    await send({"type": "http.response.start", "status": status,
+                                "headers": [(b"content-type", b"text/html; charset=UTF-8")]})
+                    await send({"type": "http.response.body", "body": b"<!DOCTYPE html><title>Just a moment...</title>"})
                     return
                 self.seen.append((scope["method"], headers))
             await app(scope, receive, send)

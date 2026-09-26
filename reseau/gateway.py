@@ -7,10 +7,15 @@ stores the id only when the server sends one and replays it only then.
 Failure isolation: each upstream connects and fails on its own. A dead or unauthenticated upstream is
 recorded in health() and raises UpstreamError on use; the others keep working.
 
+Reliability: every request goes through _Reliable, which applies reseau/outbound.py's policy (per-host
+concurrency cap, backoff on 429/5xx honouring Retry-After) to the SDK's async transport. Retried: idempotent
+HTTP methods, the MCP handshake/listing methods, and the upstream's bootstrap tool; never other tools/call.
+
 Secrets: tokens go into request headers only. Every error message built here names the env var,
 never its value. Tool results and upstream errors are scrubbed of every known token before they are
 returned, and install_log_redaction() (run by Gateway) scrubs every log record in the process.
 """
+import json
 import logging
 import os
 from contextlib import AsyncExitStack
@@ -22,9 +27,12 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
+from reseau import outbound
+
 log = logging.getLogger("reseau.gateway")
 
-USER_AGENT = "reseau-gateway/0.1"  # be.graph8.com's Cloudflare bans library-default UAs; send an explicit one.
+USER_AGENT = outbound.USER_AGENT  # be.graph8.com's Cloudflare bans library-default UAs; send an explicit one.
+RETRY_POLICY = outbound.RetryPolicy()
 CONNECT_TIMEOUT = 30.0
 
 # JSON-RPC server-error range codes for gateway-originated errors.
@@ -162,7 +170,8 @@ class _Conn:
         self.client = None
         self.error = None
         self.last_status = None
-        self.bootstrapped = False
+        self.context_gen = 0  # bumped by each bootstrap; 0 = never bootstrapped on this connection
+        self.bootstrap_lock = None
         self.stop = self.done = None
 
     async def on_response(self, response):
@@ -179,9 +188,85 @@ class _Conn:
         if self.last_status in (401, 403):
             return UpstreamError(UNAUTHORIZED, "%s: upstream rejected credential from %s (HTTP %d)"
                                  % (up.name, up.token_env, self.last_status), up.name, "unauthorized", up.token_env)
+        if self.last_status == 429:  # still throttled after _Reliable's backoff
+            return UpstreamError(UPSTREAM_UNAVAILABLE, "%s: upstream rate limited (HTTP 429)" % up.name,
+                                 up.name, "rate_limited")
         detail = redact(exc.message, SECRETS) if isinstance(exc, MCPError) else type(exc).__name__
         return UpstreamError(UPSTREAM_UNAVAILABLE, "%s: upstream unavailable (%s)" % (up.name, detail),
                              up.name, "unavailable")
+
+
+class _SlotStream(httpx2.AsyncByteStream):
+    """Response body that frees its concurrency slot when closed, so the cap covers the whole exchange
+    (a Streamable HTTP POST can answer with SSE headers first and the tool result much later)."""
+
+    def __init__(self, stream, release):
+        self.stream, self.release = stream, release
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self):
+        try:
+            await self.stream.aclose()
+        finally:
+            if self.release:
+                self.release, release = None, self.release
+                release()
+
+
+class _Reliable(httpx2.AsyncBaseTransport):
+    """outbound.Client's policy for the SDK's async httpx transport. outbound.Client itself is sync and
+    buffers bodies, which the SDK's streaming (SSE) exchange can't use; the rules are shared, not copied."""
+
+    def __init__(self, slots, retry_tools=frozenset(), inner=None):
+        self.slots, self.retry_tools = slots, retry_tools
+        self.inner = inner or httpx2.AsyncHTTPTransport()
+
+    def _retryable(self, request):
+        if request.method in outbound.IDEMPOTENT_METHODS:
+            return True
+        try:
+            msg = json.loads(request.content)
+        except ValueError:
+            return False
+        if not isinstance(msg, dict):
+            return False
+        if msg.get("method") == "tools/call":
+            return (msg.get("params") or {}).get("name") in self.retry_tools
+        return msg.get("method") in outbound.SAFE_MCP_METHODS
+
+    async def handle_async_request(self, request):
+        # The standalone GET SSE stream stays open for the whole session; capping it would pin a slot forever.
+        slot = None if request.method == "GET" else self.slots.setdefault(
+            outbound.host_key(str(request.url)), anyio.Semaphore(outbound.MAX_PER_HOST))
+        retry = self._retryable(request)
+        attempt = 0
+        while True:
+            attempt += 1
+            if slot:
+                await slot.acquire()
+            try:
+                resp = await self.inner.handle_async_request(request)
+            except BaseException:
+                if slot:
+                    slot.release()
+                raise
+            if slot:
+                # ponytail: a response the caller never closes leaks its slot; the SDK always closes them.
+                resp.stream = _SlotStream(resp.stream, slot.release)
+            wait = None
+            if retry and resp.status_code in outbound.RETRY_STATUSES:
+                wait = RETRY_POLICY.delay(attempt, outbound.parse_retry_after(resp.headers.get("retry-after")))
+            if wait is None:
+                return resp
+            await resp.aclose()
+            log.warning("retrying %s %s in %.2fs after HTTP %d", request.method, request.url, wait, resp.status_code)
+            await anyio.sleep(wait)
+
+    async def aclose(self):
+        await self.inner.aclose()
 
 
 class Gateway:
@@ -195,6 +280,7 @@ class Gateway:
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
+        self.slots = {}  # host_key -> semaphore, shared by every upstream on that host
 
     async def __aenter__(self):
         self._tg = anyio.create_task_group()
@@ -213,7 +299,7 @@ class Gateway:
 
     async def _own(self, c, *, task_status):
         c.error, c.last_status, c.stop, c.done = None, None, anyio.Event(), anyio.Event()
-        c.bootstrapped = False
+        c.context_gen, c.bootstrap_lock = 0, anyio.Lock()
         started = False
         try:
             token = resolve_credential(c.upstream, self.env)
@@ -223,6 +309,7 @@ class Gateway:
                     headers=build_headers(token),
                     timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=300.0),
                     event_hooks={"response": [c.on_response]},
+                    transport=_Reliable(self.slots, {c.upstream.bootstrap_tool} - {None}),
                 ))
                 c.client = await stack.enter_async_context(
                     Client(streamable_http_client(c.upstream.url, http_client=http), mode="legacy"))
@@ -297,28 +384,32 @@ class Gateway:
     async def call_tool(self, name, tool, arguments=None):
         c = self._conn(name)
         up = c.upstream
+        args = arguments or {}
 
-        async def bootstrap(client):
-            await client.call_tool(up.bootstrap_tool, {})
-            c.bootstrapped = True
+        async def establish(client, stale_gen):
+            """Bootstrap unless another caller already did since stale_gen: concurrent callers share one call."""
+            async with c.bootstrap_lock:
+                if c.context_gen == stale_gen:
+                    await client.call_tool(up.bootstrap_tool, {})
+                    c.context_gen += 1
 
         async def op(client):
-            args = arguments or {}
-            if up.bootstrap_tool and not c.bootstrapped:
-                # ponytail: concurrent first calls may each bootstrap; harmless, it's idempotent and cheap.
-                await bootstrap(client)
-            try:
+            if not up.bootstrap_tool:
                 return await client.call_tool(tool, args)
-            except MCPError as exc:
-                if not up.bootstrap_tool or exc.code != up.gate_code:
-                    raise
-            await bootstrap(client)  # context lost mid-session: re-establish once, retry once, never loop
+            if c.context_gen == 0:
+                await establish(client, 0)
+            seen = c.context_gen
             try:
                 return await client.call_tool(tool, args)
             except MCPError as exc:
                 if exc.code != up.gate_code:
                     raise
-            c.bootstrapped = False
+            await establish(client, seen)  # context lost mid-session: re-establish once, retry once, never loop
+            try:
+                return await client.call_tool(tool, args)
+            except MCPError as exc:
+                if exc.code != up.gate_code:
+                    raise
             raise UpstreamError(CONTEXT_NOT_ESTABLISHED, "%s: context still not established after %s; not retrying"
                                 % (name, up.bootstrap_tool), name, "context_not_established")
 

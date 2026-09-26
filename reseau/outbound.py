@@ -116,6 +116,20 @@ def host_key(url):
     return (u.hostname or "").rstrip("."), u.port or (443 if u.scheme.lower() == "https" else 80)
 
 
+def parse_retry_after(value, clock=time.time):
+    """Retry-After header (delta-seconds or HTTP-date) -> seconds to wait, or None if absent/unparseable."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() - clock())
+    except (TypeError, ValueError):
+        return None
+
+
 def _snippet(raw):
     return " ".join(raw[:400].decode("utf-8", "replace").split())[:200]
 
@@ -143,16 +157,7 @@ class Client:
             return self._slots.setdefault(host, threading.BoundedSemaphore(self.max_per_host))
 
     def _retry_after(self, value):
-        if not value:
-            return None
-        try:
-            return max(0.0, float(value))
-        except ValueError:
-            pass
-        try:
-            return max(0.0, parsedate_to_datetime(value).timestamp() - self.clock())
-        except (TypeError, ValueError):
-            return None
+        return parse_retry_after(value, self.clock)
 
     def request(self, method, url, body=None, headers=None, retry=None):
         """-> Response. Raises HttpError only; non-JSON bodies never surface as parse exceptions."""
