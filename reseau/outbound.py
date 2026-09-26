@@ -79,9 +79,41 @@ def http_transport(method, url, headers, body, connect_timeout, read_timeout):
         conn.sock.settimeout(read_timeout)
         conn.request(method, (u.path or "/") + ("?" + u.query if u.query else ""), body=body, headers=headers)
         r = conn.getresponse()
-        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        h = {k.lower(): v for k, v in r.getheaders()}
+        sse = h.get("content-type", "").split(";")[0].strip().lower() == "text/event-stream"
+        return r.status, h, read_sse_response(r, read_timeout) if sse else r.read()
     finally:
         conn.close()
+
+
+def read_sse_response(fp, budget, clock=time.monotonic):
+    """Read an SSE body only up to the first JSON-RPC response event: servers may keep the stream open (heartbeats)
+    after answering. budget caps the whole read, since each heartbeat resets the socket read timeout."""
+    deadline, buf, data = clock() + budget, [], []
+    while True:
+        line = fp.readline()
+        if not line:
+            return b"".join(buf)
+        buf.append(line)
+        s = line.rstrip(b"\r\n")
+        if s.startswith(b"data:"):
+            data.append(s[6:] if s.startswith(b"data: ") else s[5:])
+        elif not s and data:
+            try:
+                msg = json.loads(b"\n".join(data))
+            except ValueError:
+                msg = None  # left for _parse to report as bad_json
+            if isinstance(msg, dict) and ("result" in msg or "error" in msg):
+                return b"".join(buf)
+            data = []
+        if clock() > deadline:
+            raise socket.timeout("no JSON-RPC response on SSE stream within %ss" % budget)
+
+
+def host_key(url):
+    """Semaphore key: be.graph8.com, BE.GRAPH8.COM. and be.graph8.com:443 are one host."""
+    u = urllib.parse.urlsplit(url)
+    return (u.hostname or "").rstrip("."), u.port or (443 if u.scheme.lower() == "https" else 80)
 
 
 def _snippet(raw):
@@ -100,11 +132,10 @@ def _parse_sse(text):
 
 class Client:
     def __init__(self, transport=http_transport, policy=None, sleep=time.sleep, clock=time.time,
-                 max_per_host=MAX_PER_HOST, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT,
-                 user_agent=USER_AGENT):
+                 max_per_host=MAX_PER_HOST, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
         self.transport, self.policy = transport, policy or RetryPolicy()
         self.sleep, self.clock, self.max_per_host = sleep, clock, max_per_host
-        self.connect_timeout, self.read_timeout, self.user_agent = connect_timeout, read_timeout, user_agent
+        self.connect_timeout, self.read_timeout = connect_timeout, read_timeout
         self._lock, self._slots = threading.Lock(), {}
 
     def _slot(self, host):
@@ -127,14 +158,16 @@ class Client:
         """-> Response. Raises HttpError only; non-JSON bodies never surface as parse exceptions."""
         method = method.upper()
         retry = method in IDEMPOTENT_METHODS if retry is None else retry
-        headers = {"User-Agent": self.user_agent, "Accept": "application/json, text/event-stream", **(headers or {})}
-        host = urllib.parse.urlsplit(url).netloc
+        headers = {k.lower(): v for k, v in (headers or {}).items()}
+        headers["user-agent"] = USER_AGENT  # enforced: caller headers can never reintroduce a banned library default
+        headers.setdefault("accept", "application/json, text/event-stream")
+        slot = self._slot(host_key(url))
         attempt = 0
         while True:
             attempt += 1
             retry_after = None
             try:
-                with self._slot(host):
+                with slot:
                     status, rh, raw = self.transport(method, url, headers, body, self.connect_timeout, self.read_timeout)
             except (socket.timeout, TimeoutError) as e:
                 log.info("%s %s -> timeout (attempt %d)", method, url, attempt)

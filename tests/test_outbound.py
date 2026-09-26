@@ -1,4 +1,5 @@
 """HAR-90: python3 -m unittest discover -s tests -t .   (stdlib only; no real backoff sleeps)"""
+import io
 import json
 import socket
 import threading
@@ -6,7 +7,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from reseau import outbound
-from reseau.outbound import Client, HttpError, RetryPolicy
+from reseau.outbound import Client, HttpError, RetryPolicy, host_key, read_sse_response
 
 URL = "https://be.graph8.com/mcp/"
 CF_429 = b'<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>cf challenge</body></html>'
@@ -48,10 +49,41 @@ class OutboundTest(unittest.TestCase):
         fake = Fake((200, JSON, b"{}"))
         c, _ = client(fake)
         c.request("GET", URL)
-        ua = fake.calls[0]["headers"]["User-Agent"]
+        ua = fake.calls[0]["headers"]["user-agent"]
         self.assertEqual(ua, outbound.USER_AGENT)
         self.assertNotRegex(ua.lower(), r"python|urllib|requests|httpx|aiohttp")
         self.assertEqual(fake.calls[0]["timeouts"], (outbound.CONNECT_TIMEOUT, outbound.READ_TIMEOUT))
+
+    def test_caller_headers_cannot_override_or_duplicate_user_agent(self):
+        fake = Fake((200, JSON, b"{}"))
+        c, _ = client(fake)
+        c.request("GET", URL, headers={"user-agent": "Python-urllib/3.9", "User-Agent": "curl/8", "X-Trace": "1"})
+        sent = fake.calls[0]["headers"]
+        self.assertEqual([v for k, v in sent.items() if k.lower() == "user-agent"], [outbound.USER_AGENT])
+        self.assertEqual(sent["x-trace"], "1")
+
+    def test_equivalent_host_urls_share_one_concurrency_slot(self):
+        c = Client()
+        keys = {host_key(u) for u in ("https://be.graph8.com/mcp/", "https://BE.GRAPH8.COM/x",
+                                      "https://be.graph8.com:443/", "https://be.graph8.com./")}
+        self.assertEqual(keys, {("be.graph8.com", 443)})
+        self.assertIs(c._slot(host_key("https://be.graph8.com/")), c._slot(host_key("HTTPS://Be.Graph8.com:443/")))
+        self.assertNotEqual(host_key("http://be.graph8.com/"), host_key("https://be.graph8.com/"))
+
+    def test_sse_read_stops_at_response_without_draining_stream(self):
+        result = b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+        fp = io.BytesIO(b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n' + result + b": ping\n\n" * 100)
+        raw = read_sse_response(fp, budget=60)
+        self.assertTrue(raw.endswith(result))
+        self.assertEqual(fp.read(), b": ping\n\n" * 100)  # heartbeats after the answer are never waited on
+
+    def test_sse_heartbeats_without_response_hit_overall_deadline(self):
+        class Heartbeats:
+            def readline(self):
+                return b": ping\n"
+        ticks = iter(range(1000))
+        with self.assertRaises(socket.timeout):
+            read_sse_response(Heartbeats(), budget=5, clock=lambda: next(ticks))
 
     def test_403_1010_is_structured_and_not_retried(self):
         fake = Fake((403, HTML, CF_1010))
@@ -155,7 +187,7 @@ class MockServerTest(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers["Content-Length"]))
-                seen.append(self.headers["User-Agent"])
+                seen.append(self.headers.get_all("User-Agent"))
                 status, ctype, body = ((429, "text/html", CF_429) if len(seen) <= 2
                                        else (200, "application/json", json.dumps(OK).encode()))
                 self.send_response(status)
@@ -178,7 +210,32 @@ class MockServerTest(unittest.TestCase):
         self.assertEqual(resp.data, OK)
         attempts = [m for m in logs.output if "(attempt " in m]
         self.assertEqual(len(attempts), 3, logs.output)
-        self.assertEqual((len(sleeps), set(seen)), (2, {outbound.USER_AGENT}))
+        self.assertEqual((len(sleeps), seen), (2, [[outbound.USER_AGENT]] * 3))
+
+    def test_sse_result_returned_while_stream_stays_open(self):
+        done = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"data: " + json.dumps(OK).encode() + b"\n\n")
+                self.wfile.flush()
+                done.wait(10)  # keep the stream open until the client has returned
+
+            def log_message(self, *_):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(done.set)
+        resp = Client(read_timeout=5).rpc("http://127.0.0.1:%d/mcp/" % srv.server_port, INIT)
+        self.assertFalse(done.is_set())  # returned before the server closed the stream
+        self.assertEqual(resp.data, OK)
 
 
 if __name__ == "__main__":
