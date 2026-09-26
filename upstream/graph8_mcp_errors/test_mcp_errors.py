@@ -246,3 +246,11 @@ def test_hung_server_times_out_with_phase(monkeypatch, silent_tcp_url, handler, 
     assert elapsed < 1 + 3  # timeout plus the SDK's 2s child-termination grace
     assert result["success"] is False
     assert result["message"] == f"Timed out after 1s during {phase}"
+
+
+GATEWAY_CUTOFF = 15.6  # fastest observed 502 on a hung request (test_connection/FINDINGS.md, Run 3)
+
+
+def test_default_timeout_answers_before_the_gateway():
+    # The tests above patch the deadline to 1s. This pins the real default.
+    assert mcp_errors.MCP_CONNECT_TIMEOUT + 3 < GATEWAY_CUTOFF  # 3s: child-termination grace plus route overhead

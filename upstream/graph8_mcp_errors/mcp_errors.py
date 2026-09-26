@@ -38,9 +38,9 @@ except NameError:  # Python 3.10: anyio installs the backport
 
 logger = logging.getLogger(__name__)
 
-# Graph8's call. Keep it well below the Cloudflare origin timeout (100s by default); the SDK can
-# add ~2s after it while it terminates a stdio child.
-MCP_CONNECT_TIMEOUT = 30
+# Graph8's call. Hung requests were measured returning 502 at 15.6-15.9s (test_connection/FINDINGS.md,
+# Run 3), so this stays well under that: the SDK can add ~2s terminating a stdio child, plus route overhead.
+MCP_CONNECT_TIMEOUT = 10
 
 # httpx appends this to HTTPStatusError messages. It is noise, not diagnosis.
 _HTTPX_DOCS_SUFFIX = re.compile(r"\nFor more information check: https://developer\.mozilla\.org/\S*")
