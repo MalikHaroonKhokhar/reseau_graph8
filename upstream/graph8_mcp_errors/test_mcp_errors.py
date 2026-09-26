@@ -1,5 +1,8 @@
 """Run: uv run --python 3.12 --with pytest --with "mcp<2" python -m pytest upstream/graph8_mcp_errors -q"""
+import contextlib
+import logging
 import socket
+import sys
 import threading
 import time
 
@@ -7,7 +10,10 @@ import anyio
 import httpx
 import pytest
 
+import mcp_errors  # module import: pytest would otherwise collect mcp_errors.test_server as a test
 from mcp_errors import describe_mcp_error
+
+CANARY = "canary-first-line\ncanary-second-line"
 
 
 def _http_405():
@@ -21,7 +27,11 @@ def _http_405():
     )
 
 
-# --- unit ---
+def _assert_no_canary(text):
+    assert "canary-first-line" not in text and "canary-second-line" not in text
+
+
+# --- describe_mcp_error ---
 
 def test_group_is_unwrapped_to_leaf():
     exc = ExceptionGroup("unhandled errors in a TaskGroup", [_http_405()])
@@ -49,28 +59,52 @@ def test_plain_exception_message_unchanged():
 def test_secrets_are_redacted():
     exc = ExceptionGroup("g", [RuntimeError("auth failed for token lin_api_SECRET at https://gw/g8/cap123/sse")])
     msg = describe_mcp_error(exc, redact=["lin_api_SECRET", "cap123", ""])
-    assert "lin_api_SECRET" not in msg and "cap123" not in msg
     assert msg == "RuntimeError: auth failed for token *** at https://gw/g8/***/sse"
 
 
-# --- integration: the real MCP client, doing what Graph8's /test does ---
-
-async def _graph8_style_test(client_cm):
-    from mcp import ClientSession
-
-    async with client_cm as streams:
-        async with ClientSession(streams[0], streams[1]) as session:
-            await session.initialize()
-            return len((await session.list_tools()).tools)
+def test_multiline_secret_is_fully_redacted():
+    exc = ExceptionGroup("g", [RuntimeError(f"child printed {CANARY} then exited")])
+    msg = describe_mcp_error(exc, redact=[CANARY])
+    _assert_no_canary(msg)
+    assert msg == "RuntimeError: child printed *** then exited"
 
 
-def _run_and_describe(client_cm):
-    try:
-        anyio.run(_graph8_style_test, client_cm)
-    except Exception as exc:
-        return exc
-    pytest.fail("connection unexpectedly succeeded")
+def test_multiline_diagnostics_are_kept():
+    exc = ExceptionGroup("g", [RuntimeError("Transport failed\nHTTP 405; content-type: application/json")])
+    assert describe_mcp_error(exc) == "RuntimeError: Transport failed\nHTTP 405; content-type: application/json"
 
+
+# --- endpoint handlers, mocked client (the ticket's red test) ---
+
+@pytest.fixture
+def failing_sse(monkeypatch):
+    @contextlib.asynccontextmanager
+    async def fake_sse_client(url):
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError(f"upstream said {CANARY}"), _http_405()])
+        yield
+
+    monkeypatch.setattr(mcp_errors, "sse_client", fake_sse_client)
+    return {"mcp_server_id": "uuid-1", "transport_type": "sse", "connection_url": "https://learn.microsoft.com/api/mcp",
+            "env_vars": {"TOKEN": CANARY}, "headers": {"Authorization": "Bearer hdr-secret"}}
+
+
+@pytest.mark.parametrize("handler, empty_field", [("test_server", "tools_count"), ("list_server_tools", "tools")])
+def test_handler_reports_leaves_and_logs_without_secrets(failing_sse, caplog, handler, empty_field):
+    caplog.set_level(logging.DEBUG)
+    result = anyio.run(getattr(mcp_errors, handler), failing_sse)
+
+    assert result == {
+        "success": False,
+        "message": "RuntimeError: upstream said ***; HTTPStatusError: Client error '405 Method Not Allowed' "
+                   "for url 'https://learn.microsoft.com/api/mcp'",
+        empty_field: None,
+    }
+    assert "uuid-1" in caplog.text and "405 Method Not Allowed" in caplog.text
+    _assert_no_canary(caplog.text)
+    assert all(r.exc_info is None for r in caplog.records)
+
+
+# --- endpoint handlers, real MCP client ---
 
 @pytest.fixture(scope="module")
 def streamable_only_url():
@@ -94,23 +128,44 @@ def streamable_only_url():
     server.should_exit = True
 
 
-def test_sse_client_against_streamable_only_server(streamable_only_url):
-    from mcp.client.sse import sse_client
+def test_sse_registration_of_streamable_only_server(streamable_only_url, caplog):
+    server = {"mcp_server_id": "uuid-2", "transport_type": "sse", "connection_url": streamable_only_url}
+    result = anyio.run(mcp_errors.test_server, server)
+    print("sse -> streamable:", result)
 
-    exc = _run_and_describe(sse_client(streamable_only_url))
-    msg = describe_mcp_error(exc)
-    print("sse -> streamable:", repr(str(exc)), "=>", repr(msg))
-    assert "TaskGroup" not in msg
+    assert result["success"] is False and result["tools_count"] is None
     # The streamable endpoint rejects the SSE GET. The status depends on the server (400 here, 405 on learn.microsoft.com).
-    assert msg.startswith("HTTPStatusError: Client error '4")
+    assert result["message"].startswith("HTTPStatusError: Client error '4")
+    assert result["message"] in caplog.text
 
 
-def test_stdio_process_that_is_not_an_mcp_server():
-    from mcp import StdioServerParameters
-    from mcp.client.stdio import stdio_client
+def test_stdio_process_that_is_not_an_mcp_server(caplog):
+    caplog.set_level(logging.DEBUG, logger="mcp_errors")
+    server = {"mcp_server_id": "uuid-3", "transport_type": "stdio", "command": "sh",
+              "args": ["-c", 'echo "$TOKEN" >&2; exit 0'], "env_vars": {"TOKEN": CANARY}}
+    result = anyio.run(mcp_errors.list_server_tools, server)
+    print("stdio sh:", result)
 
-    params = StdioServerParameters(command="sh", args=["-c", "echo not-json; exit 0"], env={"TOKEN": "s3cret"})
-    exc = _run_and_describe(stdio_client(params))
-    msg = describe_mcp_error(exc, redact=params.env.values())
-    print("stdio sh:", repr(str(exc)), "=>", repr(msg))
-    assert "TaskGroup" not in msg and msg
+    assert result["success"] is False and "TaskGroup" not in result["message"]
+    _assert_no_canary(result["message"])
+    _assert_no_canary(caplog.text)
+
+
+STDIO_SERVER = """
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("ok")
+
+@mcp.tool()
+def ping() -> str:
+    return "pong"
+
+mcp.run()
+"""
+
+
+@pytest.mark.parametrize("handler", ["test_server", "list_server_tools"])
+def test_working_server_still_succeeds(handler):
+    server = {"transport_type": "stdio", "command": sys.executable, "args": ["-c", STDIO_SERVER]}
+    result = anyio.run(getattr(mcp_errors, handler), server)
+    assert result["success"] is True and result["message"] == "Connection successful"
+    assert result.get("tools_count", 1) == 1 and [t["name"] for t in result.get("tools", [{"name": "ping"}])] == ["ping"]
