@@ -6,17 +6,27 @@ import time
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
+from mcp.shared.exceptions import MCPError
 
 
 class MockUpstream:
     def __init__(self, token, stateless):
         self.token = token
+        self.fail_status = None  # set to e.g. 503 to fail every request after auth
         self.seen = []  # (method, headers dict) of every request that passed auth
         server = MCPServer("mock-" + ("stateless" if stateless else "stateful"))
 
         @server.tool()
         def echo(text: str) -> str:
             return "echo:" + text
+
+        @server.tool()
+        def echo_struct(text: str) -> dict[str, str]:
+            return {"text": text}
+
+        @server.tool()
+        def rpc_fail(text: str) -> str:
+            raise MCPError(-32000, "upstream failed on " + text, {"input": text})
 
         app = server.streamable_http_app(stateless_http=stateless)
 
@@ -27,6 +37,10 @@ class MockUpstream:
                     await send({"type": "http.response.start", "status": 401,
                                 "headers": [(b"www-authenticate", b'Bearer error="invalid_token"')]})
                     await send({"type": "http.response.body", "body": b"unauthorized"})
+                    return
+                if self.fail_status:
+                    await send({"type": "http.response.start", "status": self.fail_status, "headers": []})
+                    await send({"type": "http.response.body", "body": b"unavailable"})
                     return
                 self.seen.append((scope["method"], headers))
             await app(scope, receive, send)

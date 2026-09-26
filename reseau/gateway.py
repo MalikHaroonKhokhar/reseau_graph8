@@ -8,7 +8,8 @@ Failure isolation: each upstream connects and fails on its own. A dead or unauth
 recorded in health() and raises UpstreamError on use; the others keep working.
 
 Secrets: tokens go into request headers only. Every error message built here names the env var,
-never its value, and RedactingFilter scrubs known tokens from any log record as a second line.
+never its value. Tool results and upstream errors are scrubbed of every known token before they are
+returned, and install_log_redaction() (run by Gateway) scrubs every log record in the process.
 """
 import logging
 import os
@@ -75,19 +76,54 @@ def redact(text, secrets):
     return text
 
 
-class RedactingFilter(logging.Filter):
-    """Scrub known secrets from a record's final message. Attach to handlers that may see SDK/httpx logs."""
+def scrub(value, secrets):
+    """redact() over every string in a JSON-shaped value (keys too).
+    ponytail: exact-substring match only; base64/URL-encoded echoes of a token (image/blob content) pass."""
+    if isinstance(value, str):
+        return redact(value, secrets)
+    if isinstance(value, dict):
+        return {scrub(k, secrets): scrub(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub(v, secrets) for v in value]
+    return value
 
-    def __init__(self, secrets):
-        super().__init__()
-        self.secrets = secrets  # live collection: the gateway adds tokens as it resolves them
 
-    def filter(self, record):
-        msg = record.getMessage()
-        clean = redact(msg, self.secrets)
-        if clean != msg:
-            record.msg, record.args = clean, None
-        return True
+def scrub_model(model, secrets):
+    """Sanitize an SDK model (tool result: content, structured content, meta; or a Tool) before it leaves the gateway."""
+    return type(model).model_validate(scrub(model.model_dump(by_alias=True, mode="json"), secrets))
+
+
+def scrub_error(err, secrets):
+    return MCPError(err.code, redact(err.message, secrets), scrub(err.data, secrets))
+
+
+SECRETS = set()  # every token any Gateway has resolved; read by the log record factory below
+_log_redaction_installed = False
+
+
+def install_log_redaction(secrets=SECRETS):
+    """Redact secrets from every log record in the process, including formatted tracebacks and stack info.
+    Done at record creation (not as a handler filter) so it covers every logger and handler, present or
+    added later, including the SDK's and httpx's. Idempotent."""
+    global _log_redaction_installed
+    if _log_redaction_installed:
+        return
+    previous = logging.getLogRecordFactory()
+
+    def factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        if secrets:
+            record.msg, record.args = redact(record.getMessage(), secrets), None
+            if record.exc_info:
+                # Pre-format so handlers use exc_text; drop exc_info so no formatter re-renders the raw exception.
+                record.exc_text = redact(logging.Formatter().formatException(record.exc_info), secrets)
+                record.exc_info = None
+            if record.stack_info:
+                record.stack_info = redact(record.stack_info, secrets)
+        return record
+
+    logging.setLogRecordFactory(factory)
+    _log_redaction_installed = True
 
 
 class _Conn:
@@ -115,7 +151,7 @@ class _Conn:
         if self.last_status in (401, 403):
             return UpstreamError(UNAUTHORIZED, "%s: upstream rejected credential from %s (HTTP %d)"
                                  % (up.name, up.token_env, self.last_status), up.name, "unauthorized", up.token_env)
-        detail = exc.message if isinstance(exc, MCPError) else type(exc).__name__
+        detail = redact(exc.message, SECRETS) if isinstance(exc, MCPError) else type(exc).__name__
         return UpstreamError(UPSTREAM_UNAVAILABLE, "%s: upstream unavailable (%s)" % (up.name, detail),
                              up.name, "unavailable")
 
@@ -128,7 +164,8 @@ class Gateway:
 
     def __init__(self, upstreams=DEFAULT_UPSTREAMS, env=os.environ):
         self.env = env
-        self.secrets = set()
+        self.secrets = SECRETS
+        install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
 
     async def __aenter__(self):
@@ -166,7 +203,7 @@ class Gateway:
         except Exception as exc:
             err = c.classify(exc)
             if not isinstance(err, UpstreamError):
-                err = UpstreamError(UPSTREAM_UNAVAILABLE, "%s: initialize failed (%s)" % (c.upstream.name, err.message),
+                err = UpstreamError(UPSTREAM_UNAVAILABLE, "%s: initialize failed (%s)" % (c.upstream.name, redact(err.message, self.secrets)),
                                     c.upstream.name, "unavailable")
             c.error = c.error or err
             log.warning("upstream %s down: %s", c.upstream.name, redact(c.error.message, self.secrets))
@@ -186,7 +223,7 @@ class Gateway:
         await self._tg.start(self._own, c)
 
     def health(self):
-        return {n: {"ok": c.client is not None,
+        return {n: {"ok": c.client is not None and c.error is None,
                     "error": None if c.error is None else {"code": c.error.code, "message": c.error.message, **c.error.data}}
                 for n, c in self.conns.items()}
 
@@ -196,18 +233,26 @@ class Gateway:
         return self.conns[name]
 
     async def _use(self, name, op):
+        """Run op on the upstream. Health: a transport failure (unauthorized/unavailable) is recorded in
+        c.error; the next call that reaches the upstream (success, or an upstream-sent JSON-RPC error)
+        clears it. Unauthorized also closes the session, so only reconnect() recovers from it."""
         c = self._conn(name)
         if c.client is None:
             raise c.error or UpstreamError(UPSTREAM_UNAVAILABLE, "%s: not connected" % name, name, "unavailable")
         c.last_status = None  # ponytail: shared per upstream, concurrent calls may misattribute a 401; per-request status if that bites
         try:
-            return await op(c.client)
+            result = await op(c.client)
         except Exception as exc:
             err = c.classify(exc)
-            if isinstance(err, UpstreamError) and err.data["kind"] == "unauthorized":
-                c.error = err  # credential went bad mid-session; health shows it until reconnect()
+            if not isinstance(err, UpstreamError):
+                c.error = None  # upstream answered with its own error: reachable
+                raise scrub_error(err, self.secrets) from None
+            c.error = err
+            if err.data["kind"] == "unauthorized":
                 await self._close(c)
             raise err from None
+        c.error = None
+        return result
 
     async def list_tools(self, name):
         async def op(client):
@@ -218,10 +263,10 @@ class Gateway:
                 cursor = page.next_cursor
                 if not cursor:
                     return tools
-        return await self._use(name, op)
+        return [scrub_model(t, self.secrets) for t in await self._use(name, op)]
 
     async def call_tool(self, name, tool, arguments=None):
-        return await self._use(name, lambda client: client.call_tool(tool, arguments or {}))
+        return scrub_model(await self._use(name, lambda client: client.call_tool(tool, arguments or {})), self.secrets)
 
 
 if __name__ == "__main__":
