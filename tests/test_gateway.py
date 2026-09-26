@@ -11,8 +11,10 @@ import pytest
 from mcp.shared.exceptions import MCPError
 
 from reseau import gateway, outbound
+from mcp.types import Tool
+
 from reseau.gateway import (SECRETS, Gateway, Upstream, UpstreamError, build_headers, install_log_redaction,
-                            redact, resolve_credential, scrub)
+                            merge_tools, redact, resolve_credential, scrub)
 from tests.mock_upstream import MockUpstream
 
 GH_TOKEN, LIN_TOKEN = "ghp_secret_abc123", "lin_api_secret_xyz789"
@@ -147,7 +149,7 @@ def test_green_both_upstreams_list_and_call(mocks, caplog):
     caplog.set_level(logging.DEBUG)
     health, out = run(go())
     assert health == {"github": {"ok": True, "error": None}, "linear": {"ok": True, "error": None}}
-    names = ["echo", "slow", "echo_struct", "rpc_fail"]
+    names = ["echo", "slow", "echo_struct", "list_issues", "list_releases", "rpc_fail"]
     assert out == {"github": (names, "echo:github"), "linear": (names, "echo:linear")}
     # session id carried only when issued: stateful mock gets it after initialize, stateless never does
     assert any("mcp-session-id" in h for _, h in gh.seen)
@@ -440,3 +442,71 @@ def test_per_host_concurrency_cap():
                 return g8.peak
 
     assert run(go()) == outbound.MAX_PER_HOST
+
+
+# ---- tool-name namespacing (HAR-94) ----
+
+GH, LIN = Upstream("github", "http://gh", "T1"), Upstream("linear", "http://lin", "T2")
+
+
+def fake(*names):
+    return [Tool(name=n, description="does " + n, input_schema={"type": "object"}) for n in names]
+
+
+def test_red_colliding_raw_names_get_distinct_routed_names():
+    tools, routes = merge_tools([(GH, fake("list_issues", "list_releases")), (LIN, fake("list_issues", "list_releases"))])
+    assert [t.name for t in tools] == ["github_list_issues", "github_list_releases",
+                                       "linear_list_issues", "linear_list_releases"]
+    assert routes["github_list_issues"] == ("github", "list_issues")
+    assert routes["linear_list_issues"] == ("linear", "list_issues")
+    assert tools[0].description == "does list_issues"
+
+
+def test_mapping_is_deterministic():
+    listed = [(GH, fake("a", "b")), (LIN, fake("a"))]
+    assert merge_tools(listed)[1] == merge_tools(listed)[1]
+
+
+def test_graph8_keeps_its_own_g8_prefix():
+    from reseau.gateway import DEFAULT_UPSTREAMS, exposed_name
+    g8 = {u.name: u for u in DEFAULT_UPSTREAMS}["graph8"]
+    assert exposed_name(g8, "g8_current_org") == "g8_current_org"
+
+
+def test_collision_after_prefixing_fails_loudly():
+    crafted = Upstream("gh2", "http://x", "T3", prefix="github_")
+    with pytest.raises(ValueError, match="github_list_issues"):
+        merge_tools([(GH, fake("list_issues")), (crafted, fake("list_issues"))])
+
+
+def test_merged_surface_routes_each_name_to_its_upstream(mocks):
+    gh, lin = mocks
+    env = {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN}
+
+    async def go():
+        async with Gateway(upstreams(gh, lin), env) as gw:
+            names = [t.name for t in await gw.tools()]
+            out = {n: (await gw.call(n)).content[0].text
+                   for n in ("github_list_issues", "linear_list_issues", "github_list_releases", "linear_list_releases")}
+            with pytest.raises(UpstreamError) as e:
+                await gw.call("gitlab_list_issues")
+            return names, out, e.value
+
+    names, out, err = run(go())
+    assert len(names) == len(set(names)) == 12
+    # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
+    assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
+                   "github_list_releases": "list_releases@mock-stateful",
+                   "linear_list_releases": "list_releases@mock-stateless"}
+    assert (err.code, err.data["kind"]) == (-32006, "unknown_tool")
+
+
+def test_call_before_list_routes_after_restart(mocks):
+    gh, lin = mocks
+    env = {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN}
+
+    async def go():
+        async with Gateway(upstreams(gh, lin), env) as gw:  # fresh gateway, client still holds old names
+            return (await gw.call("linear_echo", {"text": "hi"})).content[0].text
+
+    assert run(go()) == "echo:hi"

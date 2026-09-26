@@ -41,6 +41,7 @@ UNAUTHORIZED = -32002
 UPSTREAM_UNAVAILABLE = -32003
 UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
+UNKNOWN_TOOL = -32006
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -55,12 +56,16 @@ class Upstream:
     # gate_code. Graph8 tracks org context by API key, with no Mcp-Session-Id to resume it (FINDINGS.md).
     bootstrap_tool: str | None = None
     gate_code: int | None = None
+    # Prepended to every raw tool name this upstream exposes; None = "<name>_". Raw names collide across
+    # upstreams (GitHub and Linear both have list_issues, list_releases: FINDINGS.md Run 2).
+    prefix: str | None = None
 
 
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/", "GITHUB_MCP_TOKEN"),
     Upstream("linear", "https://mcp.linear.app/mcp", "LINEAR_API_KEY"),
-    Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE),
+    Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE,
+             prefix=""),  # Graph8 already names its tools g8_*
 )
 
 
@@ -159,6 +164,25 @@ def install_log_redaction(secrets=SECRETS):
 
     logging.Logger.makeRecord = make_record
     _log_redaction_installed = True
+
+
+def exposed_name(upstream, raw):
+    return (upstream.name + "_" if upstream.prefix is None else upstream.prefix) + raw
+
+
+def merge_tools(listed):
+    """[(Upstream, [Tool])] -> (tools renamed to their exposed names, {exposed: (upstream name, raw name)}).
+    Pure; the same listing always yields the same names. Raises ValueError if two exposed names are equal."""
+    tools, routes = [], {}
+    for up, raw_tools in listed:
+        for t in raw_tools:
+            name = exposed_name(up, t.name)
+            if name in routes:
+                raise ValueError("tool name collision: %r from %s/%s and %s/%s"
+                                 % (name, *routes[name], up.name, t.name))
+            routes[name] = (up.name, t.name)
+            tools.append(t.model_copy(update={"name": name}))
+    return tools, routes
 
 
 class _Conn:
@@ -281,6 +305,7 @@ class Gateway:
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
         self.slots = {}  # host_key -> semaphore, shared by every upstream on that host
+        self.routes = {}  # exposed tool name -> (upstream name, raw name), rebuilt by tools()
 
     async def __aenter__(self):
         self._tg = anyio.create_task_group()
@@ -414,6 +439,28 @@ class Gateway:
                                 % (name, up.bootstrap_tool), name, "context_not_established")
 
         return scrub_model(await self._use(name, op), self.secrets)
+
+    async def tools(self):
+        """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream
+        is left out (health() says why). Raises ValueError on a name collision."""
+        listed = []
+        for c in self.conns.values():
+            try:
+                listed.append((c.upstream, await self.list_tools(c.upstream.name)))
+            except UpstreamError:
+                pass
+        tools, self.routes = merge_tools(listed)
+        return tools
+
+    async def call(self, name, arguments=None):
+        """tools/call by exposed name: route to the owning upstream with the raw name. An unknown name
+        re-lists once first, so a client whose tool list outlived a gateway restart still routes."""
+        if name not in self.routes:
+            await self.tools()  # ponytail: every unknown name re-lists all upstreams; rate-limit if clients spam typos
+        if name not in self.routes:
+            raise UpstreamError(UNKNOWN_TOOL, "unknown tool %r" % name, None, "unknown_tool")
+        upstream, raw = self.routes[name]
+        return await self.call_tool(upstream, raw, arguments)
 
 
 if __name__ == "__main__":
