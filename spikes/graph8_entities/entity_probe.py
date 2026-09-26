@@ -24,7 +24,8 @@ def is_commitment(task):
     if task.get("company_id") is not None:
         return True
     # ponytail: link dict shape is unverified (no linked task seen yet); adjust once one is.
-    return any((l.get("entity_type") or l.get("type")) in BIZ for l in task.get("links") or [])
+    return any((l.get("entity_type") or l.get("type")) in BIZ and (l.get("entity_id") or l.get("id"))
+               for l in task.get("links") or [])
 
 
 # entity -> [(tool, args, list key in result, qualifies(row))]; see FINDINGS.md for why these tools.
@@ -110,6 +111,8 @@ def selftest():
     assert is_commitment({"entity_type": "deal", "entity_id": "d1"})
     assert is_commitment({"company_id": 42})
     assert is_commitment({"links": [{"entity_type": "company", "entity_id": "42"}]})
+    assert not is_commitment({"links": [{"entity_type": "deal"}]})
+    assert not is_commitment({"links": [{"entity_type": "deal", "entity_id": ""}]})
     leak = {"error": {"code": -32000, "message": "Acme Corp jane@acme.com"}}
     assert safe_error("t", 500, leak) == "t -> HTTP 500 code=-32000"
     assert "acme" not in safe_error("t", 200, {"result": {"isError": True, "content": [{"text": "jane@acme.com"}]}}).lower()

@@ -18,7 +18,7 @@ Output files and stdout carry keys, types, tool names and error codes only. Erro
 | customer | `g8_search_companies` | **SAMPLE** (total 250) | any row |
 | opportunity | `g8_get_deals` | EMPTY, `total=0` | any row |
 | conversation | `g8_list_inbox`, `g8_list_meetings(scope=all, timeframe=all)` | EMPTY, `total=0` both | any row from either tool |
-| commitment | `g8_get_tasks` (scans 100) | EMPTY, `total=0` | task tied to a deal or company: `entity_type ∈ {deal, company}` with an `entity_id`, or `company_id` set, or a `links[]` entry of that type. An unlinked task reports UNQUALIFIED and does not pass. |
+| commitment | `g8_get_tasks` (scans 100) | EMPTY, `total=0` | task tied to a deal or company: `entity_type ∈ {deal, company}` with an `entity_id`, or `company_id` set, or a `links[]` entry of that type with a non-empty target ID. An unlinked task reports UNQUALIFIED and does not pass. |
 
 What the empty pages do and don't show:
 - **They don't mean the records are absent.** An empty page is consistent with an empty org, and also with a filter the key can't see past.
@@ -36,7 +36,7 @@ Customer fields are verified live. All other rows come from `outputSchema` (see 
 | **Customer** | Company (`MashupCompany`) | `g8_search_companies` (filters: `name`, `domain`, `industry`, `lifecycle_stage`) · `g8_get_contact_company` · hidden `g8_crm_get_company` | `id` **int** | `owner_id` (only populated on the `lifecycle_stage` branch; null on a plain search) | **none** on the list shape | none |
 | **Opportunity** | Deal | `g8_get_deals` (filters: `owner_*`, `outcome`, `stage_id`, `pipeline_id`, `search`, `stale_before`…) · `g8_get_deal(deal_id)` · `g8_get_company_deals(company_id)` · `g8_get_contact_deals` | `id` **UUID str** | `owner_id`, `owner_email`, `owner_name` | `created_at`, `updated_at`, `last_activity_at`, `close_date` | none |
 | **Conversation** | Two objects: inbox thread (email/SMS/LinkedIn) and meeting (calendar + transcript). Deal/company notes are a third, weaker source. | threads: `g8_list_inbox` → `g8_get_reply(reply_id, channel)` · meetings: `g8_list_meetings` → `g8_get_meeting(meeting_id)` · notes: `g8_list_notes(company_id \| deal_id \| contact_id)` | thread `id` str (+ `channel`, which is needed to fetch it); meeting `id` str, `transcript_id`; note `id` str | thread `assignees`; meeting `organizer_email`, `user_email`; note `created_by` | `created_at`, `updated_at`; meeting `start_time`/`end_time` | `meeting_url` is the **conference link**, not a Graph8 record page |
-| **Commitment** | **No first-class object.** Nearest is **Task** | `g8_get_tasks` (filters: `status`, `priority`, `assignee_id`, `search` on title only) · `g8_get_task(task_id)` | `id` **UUID str** | `assignee_id`, `assignee_name`, `created_by`, `executor_type` (human/agent) | `created_at`, `updated_at`, `due_date`, `reminder_at` | `source_url`: the originating external URL, not a Graph8 page |
+| **Commitment** | **None found in inspected surfaces** (provisional). Nearest is **Task** | `g8_get_tasks` (filters: `status`, `priority`, `assignee_id`, `search` on title only) · `g8_get_task(task_id)` | `id` **UUID str** | `assignee_id`, `assignee_name`, `created_by`, `executor_type` (human/agent) | `created_at`, `updated_at`, `due_date`, `reminder_at` | `source_url`: the originating external URL, not a Graph8 page |
 
 How each record ties back to the account:
 - deal → `company_id` (int), `contact_id`, `contacts[]`, `pipeline_id`, `stage_id`/`stage_name`, `status`, `amount`/`currency`
