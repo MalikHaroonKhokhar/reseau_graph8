@@ -1,0 +1,27 @@
+{
+  "g8_get_deals": null,
+  "g8_get_tasks": null,
+  "g8_list_inbox": null,
+  "g8_list_meetings": null,
+  "g8_search_companies": {
+    "city": "NoneType",
+    "confidence_score": "NoneType",
+    "country": "str",
+    "custom_status": "NoneType",
+    "description": "str",
+    "domain": "str",
+    "employee_count": "str",
+    "founded_year": "NoneType",
+    "id": "int",
+    "industry": "str",
+    "industry_group": "NoneType",
+    "linkedin_url": "str",
+    "mrr_cents": "NoneType",
+    "name": "str",
+    "owner_id": "NoneType",
+    "revenue": "str",
+    "state": "str",
+    "status": "NoneType",
+    "subscription_status": "NoneType"
+  }
+}
