@@ -1,0 +1,4 @@
+.env
+__pycache__/
+probe_results.json
+bridge_results.json
