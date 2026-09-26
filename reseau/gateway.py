@@ -313,6 +313,11 @@ class Gateway:
         async with anyio.create_task_group() as init:
             for c in self.conns.values():
                 init.start_soon(self._tg.start, self._own, c)
+        try:
+            await self.tools()  # startup check: a tool-name collision stops the gateway here, not at first tools/list
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
         return self
 
     async def __aexit__(self, *exc):
@@ -442,13 +447,15 @@ class Gateway:
 
     async def tools(self):
         """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream
-        is left out (health() says why). Raises ValueError on a name collision."""
+        is left out (health() says why), and so is one that answers tools/list with its own error: one bad
+        upstream never takes down the surface or startup. Raises ValueError on a name collision."""
         listed = []
         for c in self.conns.values():
             try:
                 listed.append((c.upstream, await self.list_tools(c.upstream.name)))
-            except UpstreamError:
-                pass
+            except MCPError as exc:
+                if not isinstance(exc, UpstreamError):
+                    log.warning("upstream %s tools/list failed: %s", c.upstream.name, exc.message)
         tools, self.routes = merge_tools(listed)
         return tools
 

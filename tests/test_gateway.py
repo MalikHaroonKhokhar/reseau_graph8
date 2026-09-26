@@ -510,3 +510,18 @@ def test_call_before_list_routes_after_restart(mocks):
             return (await gw.call("linear_echo", {"text": "hi"})).content[0].text
 
     assert run(go()) == "echo:hi"
+
+
+def test_collision_fails_startup_and_closes_connections(mocks):
+    gh, lin = mocks
+    env = {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN}
+    clash = [Upstream("github", gh.url, "GITHUB_MCP_TOKEN"), Upstream("linear", lin.url, "LINEAR_API_KEY", prefix="github_")]
+    gw = Gateway(clash, env)
+
+    async def go():
+        with pytest.raises(ValueError, match="tool name collision: 'github_"):
+            async with gw:
+                pytest.fail("gateway started despite a tool-name collision")
+
+    run(go())
+    assert all(c.client is None and c.done.is_set() for c in gw.conns.values())
