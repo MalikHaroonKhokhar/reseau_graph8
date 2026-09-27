@@ -20,7 +20,8 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   tools keep their own `g8_` names. Each upstream is limited to an allowlist of read-only tools.
 - **Upstream credentials never leave the gateway.** Graph8 only ever sees a gateway token.
 - **Failures stay isolated.** A dead or unauthorized upstream is left out of the tool list; the others keep
-  working.
+  working. A dropped connection fails only the call it hit, and reads are retried, so it never takes down an
+  upstream's session.
 - **Evidence behind every claim.** Réseau's own `get_evidence(activity_id)` resolves `github:pr:owner/repo#9`,
   `github:commit:owner/repo@<sha>`, `github:review_comment:owner/repo#9/<comment id>`,
   `github:review:owner/repo#9/<review id>` or `linear:issue:ENG-142` to a normalized record: canonical URL,

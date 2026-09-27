@@ -13,6 +13,11 @@ HTTP methods, the MCP handshake/listing methods, and the upstream's bootstrap to
 retried on 429 only, and only on a read_only upstream: a 429 is refused before the tool runs, so repeating it
 can't double-apply. Never on 5xx, which may come after the tool ran.
 
+A network error (connection dropped or refused, no response) is retried wherever the request is retried at all,
+read_only tools/call included: repeating a read is harmless. Otherwise it fails that one request, as a 502. It is
+never raised into the SDK: an exception in one request's POST ends the SDK's whole session, and with it every
+call in flight and every call after it.
+
 Secrets: tokens go into request headers only. Every error message built here names the env var,
 never its value. Tool results and upstream errors are scrubbed of every known token before they are
 returned, and install_log_redaction() (run by Gateway) scrubs every log record in the process.
@@ -51,6 +56,7 @@ OUT_OF_SCOPE = -32012  # after reseau/evidence's and reseau/semantic's codes
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
+INTERNAL_ERROR = -32603  # JSON-RPC's; no_response() answers with it
 
 
 @dataclass(frozen=True)
@@ -252,7 +258,10 @@ class _Conn:
         if self.last_status == 429:  # still throttled after _Reliable's backoff
             return UpstreamError(UPSTREAM_UNAVAILABLE, "%s: upstream rate limited (HTTP 429)" % up.name,
                                  up.name, "rate_limited")
-        detail = redact(exc.message, SECRETS) if isinstance(exc, MCPError) else type(exc).__name__
+        leaf = exc
+        while isinstance(leaf, BaseExceptionGroup):  # name the cause, not the task group that carried it
+            leaf = leaf.exceptions[0]
+        detail = redact(exc.message, SECRETS) if isinstance(exc, MCPError) else type(leaf).__name__
         return UpstreamError(UPSTREAM_UNAVAILABLE, "%s: upstream unavailable (%s)" % (up.name, detail),
                              up.name, "unavailable")
 
@@ -265,8 +274,12 @@ class _SlotStream(httpx2.AsyncByteStream):
         self.stream, self.release = stream, release
 
     async def __aiter__(self):
-        async for chunk in self.stream:
-            yield chunk
+        try:
+            async for chunk in self.stream:
+                yield chunk
+        except httpx2.TransportError as exc:
+            # The SDK fails one response on a StreamError; any other exception ends its whole session.
+            raise httpx2.StreamError("%s: %s" % (type(exc).__name__, redact(str(exc), SECRETS))) from exc
 
     async def aclose(self):
         try:
@@ -275,6 +288,14 @@ class _SlotStream(httpx2.AsyncByteStream):
             if self.release:
                 self.release, release = None, self.release
                 release()
+
+
+def no_response(request, exc):
+    """A request that got no HTTP response, as a 502 carrying a JSON-RPC error that names the cause. The SDK
+    fails just that request with it (a notification's is dropped), and the 502 makes classify() report it as
+    unavailable. The code is JSON-RPC's internal error: -32003 would read as Graph8's org gate in call_tool."""
+    return httpx2.Response(502, request=request, json={"jsonrpc": "2.0", "id": None, "error": {
+        "code": INTERNAL_ERROR, "message": "%s: %s" % (type(exc).__name__, redact(str(exc), SECRETS))}})
 
 
 class _Reliable(httpx2.AsyncBaseTransport):
@@ -314,10 +335,19 @@ class _Reliable(httpx2.AsyncBaseTransport):
                 await slot.acquire()
             try:
                 resp = await self.inner.handle_async_request(request)
-            except BaseException:
+            except BaseException as exc:
                 if slot:
                     slot.release()
-                raise
+                if not isinstance(exc, httpx2.TransportError):
+                    raise
+                # No response at all. Retried wherever this request is retried at all; a read timeout already
+                # waited 300 s, so it isn't. Raised, the error would end the SDK's session and every call on it.
+                wait = RETRY_POLICY.delay(attempt) if retry_on and not isinstance(exc, httpx2.ReadTimeout) else None
+                if wait is None:
+                    return no_response(request, exc)
+                log.warning("retrying %s %s in %.2fs after %s", request.method, request.url, wait, type(exc).__name__)
+                await anyio.sleep(wait)
+                continue
             if slot:
                 # ponytail: a response the caller never closes leaks its slot; the SDK always closes them.
                 resp.stream = _SlotStream(resp.stream, slot.release)
