@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Réseau</title>
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar">
+    <div class="bar-inner">
+      <span class="brand">Réseau</span>
+      <nav class="segmented" aria-label="Surfaces">
+        <a href="#today">Today</a>
+        <a href="#report">Report</a>
+        <a href="#ask">Ask</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="today" class="surface" aria-labelledby="today-title">
+      <header class="surface-head">
+        <p class="eyebrow" id="today-date"></p>
+        <h1 id="today-title" tabindex="-1">Good morning.</h1>
+        <p class="lede">Your focus, what needs attention and yesterday's work, written by Graph8 from GitHub and
+          Linear. Every sentence links to its source.</p>
+        <div class="controls">
+          <button type="button" class="primary" id="start">Start My Day</button>
+        </div>
+      </header>
+      <div class="result" id="today-result" aria-live="polite"></div>
+    </section>
+
+    <section id="report" class="surface" aria-labelledby="report-title" hidden>
+      <header class="surface-head">
+        <p class="eyebrow">Team</p>
+        <h1 id="report-title" tabindex="-1">Daily report</h1>
+        <p class="lede">What the team completed, merged, committed and is blocked on, for one day. Every number
+          matches its source.</p>
+        <form class="controls" id="report-form">
+          <label class="field">
+            <span class="field-label">Day</span>
+            <input type="date" id="report-date" name="date" required>
+          </label>
+          <button type="submit" class="primary">Run report</button>
+        </form>
+      </header>
+      <div class="result" id="report-result" aria-live="polite"></div>
+    </section>
+
+    <section id="ask" class="surface" aria-labelledby="ask-title" hidden>
+      <header class="surface-head">
+        <p class="eyebrow">Questions</p>
+        <h1 id="ask-title" tabindex="-1">Ask Réseau</h1>
+        <p class="lede">Answers come only from Réseau's tools, with their sources. Anything they don't cover gets
+          "No evidence found."</p>
+        <form class="ask-field" id="ask-form" role="search">
+          <label for="ask-input" class="visually-hidden">Question</label>
+          <input type="search" id="ask-input" name="question" required maxlength="500" autocomplete="off"
+                 enterkeyhint="send" placeholder="What is blocking the Réseau Dashboard?">
+          <button type="submit" class="primary">Ask</button>
+        </form>
+        <div class="suggestions" role="group" aria-label="Example questions">
+          <button type="button" class="suggestion">What is blocking the Réseau Dashboard?</button>
+          <button type="button" class="suggestion">Why does HAR-104 matter?</button>
+          <button type="button" class="suggestion">What was our revenue last quarter?</button>
+        </div>
+      </header>
+      <div class="result" id="ask-result" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <dialog id="evidence" class="sheet" aria-labelledby="evidence-title">
+    <div class="sheet-grabber" aria-hidden="true"></div>
+    <header class="sheet-head">
+      <h2 id="evidence-title">Evidence</h2>
+      <button type="button" class="close" id="evidence-close" aria-label="Close evidence">Done</button>
+    </header>
+    <blockquote class="sheet-claim" id="evidence-claim"></blockquote>
+    <div class="citations" id="evidence-citations" aria-label="Sources for this claim"></div>
+    <div class="record" id="evidence-record" aria-live="polite"></div>
+  </dialog>
+</body>
+</html>
