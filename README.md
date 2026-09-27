@@ -62,12 +62,11 @@ then deletes the record and verifies that it's gone.
 - **The token is in the URL.** A Graph8 registration can only carry `connection_url`, so the gateway token
   goes in the path. It's checked on the SSE stream and on every message POST, compared in constant time, and
   a wrong token gets a plain 404.
-- **Known gap: Graph8 shows the token to everyone in the org.** Its read route
+- **Known gap (accepted): Graph8 shows the token to everyone in the org.** Its read route
   (`GET /api/v1/workflows/mcp-servers`) returns `connection_url` in plaintext while a registration exists,
-  so anyone with an org key can read the token. This breaks HAR-96's original criterion "no credentials in
-  Graph8 read responses", and nothing on Réseau's side can close it: Graph8 returns every registration field,
-  so no registration can hide a secret. It stays open until Graph8 ships the fix proposed in
-  `upstream/graph8_mcp_read_redaction/` (HAR-111). Until then, keep the exposure small:
+  and nothing on Réseau's side can hide it. HAR-96 accepts this; the criterion is "no *upstream* credentials
+  in Graph8 read responses". A possible Graph8-side fix is sketched in `upstream/graph8_mcp_read_redaction/`
+  (not planned). To keep the exposure small:
   - Upstream tokens never reach Graph8. The gateway token only unlocks read-only, allowlisted tools.
   - A leaked token is useless while the tunnel is down, and the tunnel only runs while Graph8 needs it.
   - Use a fresh `RESEAU_GATEWAY_TOKEN` each session, and let `register_graph8` delete the record (no `--keep`)
