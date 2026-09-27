@@ -42,6 +42,23 @@ def g8(http, key, method, path, body=None):
     return status, (data.get("data", data) if isinstance(data, dict) else data)
 
 
+def cleanup(http, key, uuid):
+    """Delete the registration and prove it is gone. Only a 200 DELETE followed by a 200 list with a
+    well-formed `servers` array that lacks the record counts; anything else is a failed cleanup."""
+    status, _ = g8(http, key, "DELETE", "/api/v1/voice/mcp-servers/" + uuid)
+    if status != 200:
+        say("cleanup FAILED: DELETE returned HTTP", status, "- remove", uuid, "by hand")
+        return False
+    status, final = g8(http, key, "GET", "/api/v1/workflows/mcp-servers")
+    servers = final.get("servers") if isinstance(final, dict) else None
+    if status != 200 or not isinstance(servers, list) or not all(isinstance(s, dict) for s in servers):
+        say("cleanup UNVERIFIED: list returned HTTP", status, "without a servers array")
+        return False
+    gone = not any(s.get("mcp_server_id") == uuid for s in servers)
+    say("deleted:", gone, "final list:", {"servers": len(servers), "total": final.get("total")})
+    return gone
+
+
 async def gateway_tool_count(url):
     async with Client(sse_client(url), mode="legacy") as c:
         return len((await c.list_tools()).tools)
@@ -73,21 +90,16 @@ def main():
     try:
         _, listing = g8(http, key, "GET", "/api/v1/workflows/mcp-servers")
         say("read route echoes the token:", token in json.dumps(listing), "(treat RESEAU_GATEWAY_TOKEN as exposed org-wide)")
-        _, result = g8(http, key, "POST", "/api/v1/voice/mcp-servers/%s/test" % uuid)
+        status, result = g8(http, key, "POST", "/api/v1/voice/mcp-servers/%s/test" % uuid)
         say("/test:", result)
-        ok = isinstance(result, dict) and result.get("success") is True and result.get("tools_count") == expected
+        ok = status == 200 and isinstance(result, dict) and result.get("success") is True and result.get("tools_count") == expected
         say("PASS" if ok else "FAIL", "- tools_count %s, expected %s" % (
             result.get("tools_count") if isinstance(result, dict) else None, expected))
     finally:
         if a.keep:
             say("kept registration", uuid)
         else:
-            g8(http, key, "DELETE", "/api/v1/voice/mcp-servers/" + uuid)
-            _, final = g8(http, key, "GET", "/api/v1/workflows/mcp-servers")
-            gone = isinstance(final, dict) and not any(s.get("mcp_server_id") == uuid for s in final.get("servers", []))
-            say("deleted:", gone, "final list:", {"servers": len(final.get("servers", [])), "total": final.get("total")}
-                if isinstance(final, dict) else final)
-            ok = ok and gone
+            ok = cleanup(http, key, uuid) and ok
     return 0 if ok else 1
 
 
