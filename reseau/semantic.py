@@ -1,5 +1,5 @@
 """Semantic tools: get_person_activity(person, date) and get_my_day_context() (HAR-100),
-get_project_context(project) and get_team_summary(date) (HAR-101).
+get_project_context(project) and get_team_summary(date) (HAR-101), get_business_context(activity_id) (HAR-109).
 
 Work-native answers built on the HAR-98 records, so every fact carries activity_id(s) that get_evidence
 resolves. Upstreams asks the upstreams and normalizes what comes back; the functions below it are pure
@@ -41,6 +41,22 @@ HAR-101's assumptions:
   PR is credited to its author, a commit to its author.
 - Recent changes (project): issues completed and PRs merged in the last RECENT_DAYS days.
 - Counts: every count is the number of distinct activity_ids returned with it, built in one place (count).
+
+HAR-109's assumptions, the linkage HAR-107 recommends (spikes/graph8_entities/FINDINGS.md):
+- A Graph8 task whose source_url is a Linear issue or GitHub PR is a commitment made for that work (link_type
+  source_url), if it is linked to a deal or company (HAR-108's rule; any other task is left out). Linear URLs
+  match on the issue key, whatever slug follows it; PR URLs on owner/repo#number, in any case. g8_get_tasks can't
+  filter on source_url, so every task is listed and matched here.
+- A Linear issue whose description names a Graph8 activity_id (e.g. graph8:opportunity:<uuid>) links to that
+  record (link_type explicit_reference): HAR-107's fallback for work no task names yet.
+- From those, Graph8's own links: a commitment's deal, company and source meeting, and a deal's company (link_type
+  graph8_link, via the record that links it). Each record is listed once, under the first link found to it:
+  direct links before derived ones.
+- A PR links through the Linear issues it is attached to (HAR-100's rule: no attachment, no link). Linear can't
+  look an issue up by attachment, so the candidates are the issue keys in the PR's title, body and branch, where
+  Linear's GitHub integration finds them. A PR attached by hand, with no key in its text, isn't found.
+- Nothing is inferred: no name matching (HAR-107: never as evidence). A linked record that can't be read is left
+  out and named in incomplete. With no link at all, links is empty and reason is no_link_found.
 """
 import json
 import os
@@ -56,7 +72,7 @@ from mcp.shared.exceptions import MCPError
 from pydantic import TypeAdapter
 
 from reseau import evidence
-from reseau.evidence import github, linear
+from reseau.evidence import github, graph8, linear
 from reseau.evidence.records import Actor, Record
 
 TZ_ENV = "RESEAU_TIMEZONE"
@@ -83,6 +99,14 @@ ISSUE_FIELDS = ["id", "title", "priority", "status", "statusType", "updatedAt"]
 # what linear.issue needs for a record, straight from list_issues, plus when and to whom it was completed
 COMPLETED_FIELDS = ["id", "title", "url", "status", "createdBy", "createdById", "createdAt", "updatedAt",
                     "completedAt", "assigneeId"]
+WORK_KINDS = {("linear", "issue"), ("github", "pr")}  # what get_business_context takes
+LINK_ORDER = ("customer", "opportunity", "commitment", "conversation")
+ISSUE_KEY = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b")
+LINEAR_URL = re.compile(r"https?://linear\.app/[^/\s]+/issue/([A-Za-z][A-Za-z0-9]*-\d+)\b")
+GITHUB_PR_URL = re.compile(r"https?://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)\b")
+GRAPH8_REF = re.compile(r"\bgraph8:[a-z]+:[\w./-]*\w")
+# Graph8's typed links -> the activity_id of the record they point at
+RELATED = {"deal": "graph8:opportunity:%s", "company": "graph8:customer:%s", "meeting": "graph8:conversation:meeting/%s"}
 
 
 # ---- output: every fact is a record with its activity_id ----
@@ -101,7 +125,7 @@ class Gap:
     """A listing the answer may be missing results from, stated instead of dropped silently."""
     source: str
     tool: str
-    reason: str  # page_limit | search_incomplete | out_of_scope
+    reason: str  # page_limit | search_incomplete | out_of_scope | not_found | invalid_activity_id
     detail: str
 
 
@@ -207,6 +231,24 @@ class TeamSummary:
     incomplete: list[Gap]
 
 
+@dataclass(frozen=True)
+class BusinessLink:
+    activity_id: str  # graph8:<kind>:<id>
+    link_type: str  # explicit_reference | source_url | graph8_link
+    via: str  # what the link runs through: the work item, a Linear issue the PR is attached to, or a Graph8 record
+    record: Record
+
+
+@dataclass(frozen=True)
+class BusinessContext:
+    activity_id: str  # the work item asked about
+    record: Record
+    linked_issues: list[str]  # a PR's Linear issues, attached by Linear's GitHub integration; empty for an issue
+    links: list[BusinessLink]  # customers, then opportunities, commitments and conversations
+    reason: str | None  # "no_link_found" when links is empty
+    incomplete: list[Gap]
+
+
 TOOLS = [
     types.Tool(
         name="get_person_activity",
@@ -244,6 +286,19 @@ TOOLS = [
                     "are listed in unmapped and not counted; incomplete lists anything that may be missing.",
         input_schema={"type": "object", "properties": {"date": {"type": "string"}}, "required": ["date"]},
         output_schema=TypeAdapter(TeamSummary).json_schema()),
+    types.Tool(
+        name="get_business_context",
+        description="Why a Linear issue or GitHub PR matters: the Graph8 customers, opportunities (deals), "
+                    "commitments (tasks linked to a deal or company) and conversations linked to it, each with its "
+                    "activity_id and link_type, how the link was established: explicit_reference (the Linear "
+                    "issue's description names the record), source_url (a Graph8 task was created from the issue "
+                    "or PR) or graph8_link (Graph8 links it to the record in via). A PR links through the Linear "
+                    "issues it is attached to (linked_issues). Nothing is inferred: with no link, links is empty "
+                    "and reason is no_link_found. activity_id is linear:issue:<KEY> or github:pr:owner/repo#N; "
+                    "incomplete lists anything that may be missing.",
+        input_schema={"type": "object", "properties": {"activity_id": {"type": "string"}},
+                      "required": ["activity_id"]},
+        output_schema=TypeAdapter(BusinessContext).json_schema()),
 ]
 
 
@@ -327,7 +382,7 @@ class Upstreams:
     concurrently. GitHub reads stay inside scope (RESEAU_GITHUB_SCOPE); gaps collects what may be missing."""
 
     def __init__(self, call_tool, index, at, scope):
-        self.call, self.index, self.at = call_tool, index, at.isoformat(timespec="seconds")
+        self.call, self.index, self.now, self.at = call_tool, index, at, at.isoformat(timespec="seconds")
         self.scope, self.gaps = list(scope), []
 
     async def json(self, source, tool, args):
@@ -351,7 +406,8 @@ class Upstreams:
             args = advance(payload, args)
             if not args:
                 return out
-        what = {k: v for k, v in args.items() if k not in ("page", "after", "cursor", "perPage", "limit", "fields")}
+        what = {k: v for k, v in args.items()
+                if k not in ("page", "after", "cursor", "offset", "perPage", "limit", "fields")}
         self.gaps.append(Gap(source, tool, "page_limit", "stopped after %d pages with more left: %s" % (limit, what)))
         return out
 
@@ -488,6 +544,50 @@ class Upstreams:
         rec = self.rec(github.pr, p)
         return Attention(rec.activity_id, rec, found) if found else None
 
+    async def tasks(self):
+        """Every Graph8 task: g8_get_tasks can't filter on source_url (HAR-107), so the match is Réseau's."""
+        return await self.collect("graph8", "g8_get_tasks", {"limit": PAGE}, lambda page: page.get("tasks") or [],
+                                  next_offset)
+
+    async def pr_issues(self, p, pr_id):
+        """The Linear issues a PR is attached to, from the issue keys it names (issue_keys)."""
+        found = await gather(*[partial(self.json, "linear", "get_issue", {"id": k}) for k in issue_keys(p)])
+        return [i for i in found if i and attached(i, pr_id)]
+
+    async def graph8(self, activity_id, via, listed):
+        """A linked Graph8 record -> (payload, record), or None, named in gaps, when it can't be read. A commitment
+        already listed isn't fetched again."""
+        rec = activity_id in listed and graph8.commitment(listed[activity_id], {}, self.at)
+        if rec:
+            return listed[activity_id], evidence.resolve(rec, self.index)
+        try:
+            return await evidence.fetch(self.call, activity_id, self.index, self.now)
+        except MCPError as e:
+            if e.code not in (evidence.EVIDENCE_NOT_FOUND, evidence.INVALID_ACTIVITY_ID):
+                raise
+            self.gaps.append(Gap("graph8", "get_evidence", e.data["kind"], "%s (linked from %s): %s"
+                                 % (activity_id, via, e.message)))
+            return None
+
+    async def business(self, pending, listed):
+        """[(activity_id, link_type, via)] -> BusinessLinks, following Graph8's own links (related) level by level,
+        so each record is read once and kept under the first link found to it."""
+        links, seen = {}, set()
+        while pending:
+            level = []
+            for link in pending:
+                if link[0] not in seen:
+                    seen.add(link[0])
+                    level.append(link)
+            found = await gather(*[partial(self.graph8, aid, via, listed) for aid, _, via in level])
+            pending = []
+            for (aid, link_type, via), got in zip(level, found):
+                if got:
+                    payload, rec = got
+                    links[aid] = BusinessLink(aid, link_type, via, rec)
+                    pending += [(r, "graph8_link", aid) for r in related(rec.kind, payload)]
+        return sorted(links.values(), key=lambda link: (LINK_ORDER.index(link.record.kind), link.activity_id))
+
 
 # ---- pure aggregation ----
 
@@ -585,6 +685,55 @@ def unresolved(threads):
     return [t for t in threads if not t.get("is_resolved") and t.get("comments")]
 
 
+def next_offset(page, args):
+    """Graph8's offset pages."""
+    found = page.get("tasks") or []
+    return dict(args, offset=args.get("offset", 0) + len(found)) if page.get("has_next") and found else None
+
+
+def work_id(url):
+    """A Linear issue or GitHub PR URL -> its activity_id casefolded, to match on; None for any other URL. A Linear
+    URL matches on its issue key, whatever slug follows (HAR-107); a PR URL may go on to a tab (/pull/9/files)."""
+    if m := LINEAR_URL.match(url or ""):
+        return ("linear:issue:" + m[1]).casefold()
+    if m := GITHUB_PR_URL.match(url or ""):
+        return ("github:pr:%s/%s#%s" % m.groups()).casefold()
+    return None
+
+
+def issue_keys(p):
+    """The Linear issue keys a PR names in its title, body and branch, each once: where Linear's GitHub
+    integration finds them."""
+    text = "%s\n%s\n%s" % (p.get("title") or "", p.get("body") or "", ((p.get("head") or {}).get("ref") or "").upper())
+    return list(dict.fromkeys(ISSUE_KEY.findall(text)))
+
+
+def attached(issue, pr_id):
+    """Whether Linear lists the PR among the issue's attachments."""
+    return any(("github:pr:%s/%s#%s" % link).casefold() == pr_id.casefold() for link in pr_links(issue))
+
+
+def direct_links(work, issues, tasks):
+    """The Graph8 records the work names, or that name the work -> [(activity_id, link_type, via)]. work maps the
+    casefolded activity_ids of the work item and its linked issues to their own; issues are the Linear ones. A task
+    linked to no deal or company isn't a commitment, so it names no business record."""
+    named = [(ref, "explicit_reference", "linear:issue:" + i["id"]) for i in issues
+             for ref in dict.fromkeys(GRAPH8_REF.findall(i.get("description") or ""))]
+    return named + [("graph8:commitment:%s" % t["id"], "source_url", work[w]) for t in tasks
+                    if (w := work_id(t.get("source_url"))) in work and graph8.is_commitment(t)]
+
+
+def related(kind, p):
+    """What Graph8 itself links a record to: a commitment's deals, companies and source meeting; a deal's company."""
+    if kind == "commitment":
+        pairs = [(p.get("entity_type"), p.get("entity_id")), ("company", p.get("company_id")),
+                 ("meeting", p.get("source_meeting_id"))] + [(link.get("entity_type"), link.get("entity_id"))
+                                                             for link in p.get("links") or []]
+    else:
+        pairs = [("company", p.get("company_id"))] if kind == "opportunity" else []
+    return [RELATED[t] % i for t, i in pairs if t in RELATED and i not in (None, "")]
+
+
 # ---- tools ----
 
 def parse_date(value):
@@ -669,5 +818,23 @@ async def team_summary(gw, args):
                        [m for m in roster if not m.person], [b for b in blocked if b], up.gaps)
 
 
+async def business_context(gw, args):
+    aid = args.get("activity_id")
+    source, kind, _ = evidence.parse(aid)
+    if (source, kind) not in WORK_KINDS:
+        raise error(evidence.INVALID_ACTIVITY_ID, "invalid_activity_id", "get_business_context takes a "
+                    "linear:issue or github:pr activity_id, got %r" % aid, activity_id=aid)
+    at = now()
+    up = Upstreams(gw.call_tool, gw.identities, at, gw.github_scope)
+    (payload, rec), tasks = await gather(partial(evidence.fetch, gw.call_tool, aid, gw.identities, at), up.tasks)
+    linked = await up.pr_issues(payload, rec.activity_id) if kind == "pr" else []
+    issues = ["linear:issue:" + i["id"] for i in linked]
+    work = {w.casefold(): w for w in [rec.activity_id] + issues}
+    links = await up.business(direct_links(work, linked if kind == "pr" else [payload], tasks),
+                              {"graph8:commitment:%s" % t["id"]: t for t in tasks})
+    return BusinessContext(rec.activity_id, rec, issues, links, None if links else "no_link_found", up.gaps)
+
+
 HANDLERS = {"get_person_activity": person_activity, "get_my_day_context": my_day,
-            "get_project_context": project_context, "get_team_summary": team_summary}
+            "get_project_context": project_context, "get_team_summary": team_summary,
+            "get_business_context": business_context}

@@ -1,6 +1,6 @@
-"""HAR-100: get_person_activity and get_my_day_context; HAR-101: get_project_context and get_team_summary. Pure
-aggregation, the tools over a scripted world of upstream answers (built from the recorded fixtures), and the tools
-over MCP through the gateway."""
+"""HAR-100: get_person_activity and get_my_day_context; HAR-101: get_project_context and get_team_summary; HAR-109:
+get_business_context. Pure aggregation, the tools over a scripted world of upstream answers (built from the recorded
+fixtures), and the tools over MCP through the gateway."""
 import copy
 import dataclasses
 import json
@@ -18,10 +18,10 @@ from mcp.shared.exceptions import MCPError
 from reseau import evidence, semantic
 from reseau.evidence import github
 from reseau.evidence.records import Actor
-from tests.mock_upstream import MockUpstream, scripted_result
+from tests.mock_upstream import G8_COMPANY, G8_DEAL, G8_MEETING, G8_TASK, MockUpstream, scripted_result
 from tests.test_evidence import PEOPLE, fixture
 from tests.test_front import TOK, serving
-from tests.test_gateway import GH_TOKEN, LIN_TOKEN, run
+from tests.test_gateway import G8_TOKEN, GH_TOKEN, LIN_TOKEN, run
 
 NOW = datetime(2026, 9, 27, 9, tzinfo=timezone.utc)
 TODAY, YESTERDAY = "2026-09-27", "2026-09-26"
@@ -668,3 +668,201 @@ def test_green_project_and_team_over_mcp_return_schema_valid_output(tmp_path):
     assert team["total"]["completed"] == {"count": 1, "activity_ids": [ENG_142]}
     assert team["total"]["merged"] == {"count": 1, "activity_ids": [PR_9]}
     assert team["blocked"][0]["blocking_prs"][0]["activity_id"] == "github:pr:%s#9" % UI
+
+
+# ---- HAR-109: get_business_context ----
+
+PR_15 = "github:pr:%s#15" % RG  # tests/fixtures/github_pr.json
+OPP, CUSTOMER = "graph8:opportunity:" + G8_DEAL, "graph8:customer:%d" % G8_COMPANY
+COMMITMENT, MEETING = "graph8:commitment:" + G8_TASK, "graph8:conversation:meeting/" + G8_MEETING
+DEAL_2, TASK_2, TASK_3 = (G8_DEAL[:-12] + "000000000002", G8_TASK[:-12] + "000000000002",
+                          G8_TASK[:-12] + "000000000003")
+
+
+def g8_page(items, a):
+    """Graph8's offset pages."""
+    k, per = a.get("offset", 0), a["limit"]
+    return {"tasks": items[k:k + per], "total": len(items), "limit": per, "offset": k, "has_next": k + per < len(items)}
+
+
+def lookup(table, key, missing):
+    """table[key], or Graph8's live answer for a record it doesn't have (HAR-108's probe)."""
+    if key not in table:
+        raise RuntimeError(missing)
+    return table[key]
+
+
+def business_world(description="", tasks=None, attachments=((RG, 15),), pr_fields=None, deals=(), companies=()):
+    """Linear issue ENG-142 with this description, PR #15 (titled with ENG-142's key, and attached to it) and
+    Graph8: task G8_TASK, created from ENG-142 (its source_url), linked to deal G8_DEAL of company 4242."""
+    tasks = [fixture("graph8_task")] if tasks is None else tasks
+    deals = {G8_DEAL: fixture("graph8_deal"), **dict(deals)}
+    companies = {G8_COMPANY: fixture("graph8_company"), **dict(companies)}
+    eng = issue("ENG-142", "Ship SSO", "started", prs=attachments) | {"description": description}
+    pr15 = fixture("github_pr") | {"title": "ENG-142: ship SSO", "body": None} | (pr_fields or {})
+
+    def pull_request_read(a):
+        if (a["method"], a["owner"].casefold(), a["repo"].casefold(), a["pullNumber"]) == ("get", *RG.split("/"), 15):
+            return pr15
+        return not_found("pull request")
+
+    return {"github": {"pull_request_read": pull_request_read},
+            "linear": {"get_issue": lambda a: eng if a["id"] == "ENG-142" else not_found("issue")},
+            "graph8": {"g8_get_tasks": lambda a: g8_page(tasks, a),
+                       "g8_get_deal": lambda a: lookup(deals, a["deal_id"], "Error: Deal: Deal not found"),
+                       "g8_crm_get_company": lambda a: lookup(companies, a["company_id"],
+                                                              "Error: g8_crm_get_company: Company not found"),
+                       "g8_get_task": lambda a: lookup({t["id"]: t for t in tasks}, a["task_id"],
+                                                       "Task: Error: Task lookup: Task not found"),
+                       "g8_get_meeting": lambda a: lookup({G8_MEETING: fixture("graph8_meeting")}, a["meeting_id"],
+                                                          "Error: API error (400): Invalid meeting ID")}}
+
+
+def business_context(aid, w=None, **kw):
+    return run(semantic.business_context(FakeGateway(w or business_world(), **kw), {"activity_id": aid}))
+
+
+def links(ctx):
+    return [(link.activity_id, link.link_type, link.via) for link in ctx.links]
+
+
+def test_red_issue_naming_an_opportunity_links_to_it_by_explicit_reference():
+    ctx = business_context(ENG_142, business_world("Blocks the renewal: graph8:opportunity:%s." % G8_DEAL, tasks=[]))
+    assert links(ctx) == [(CUSTOMER, "graph8_link", OPP), (OPP, "explicit_reference", ENG_142)]
+    assert (ctx.activity_id, ctx.linked_issues, ctx.reason, ctx.incomplete) == (ENG_142, [], None, [])
+    assert [(link.record.kind, link.record.title) for link in ctx.links] == [
+        ("customer", "Example Customer Co"), ("opportunity", "Example Customer Co - annual plan")]
+
+
+def test_task_created_from_the_issue_is_its_commitment_and_leads_to_the_deal_and_customer():
+    gw = FakeGateway(business_world())
+    ctx = run(semantic.business_context(gw, {"activity_id": ENG_142}))
+    assert links(ctx) == [(CUSTOMER, "graph8_link", OPP), (OPP, "graph8_link", COMMITMENT),
+                          (COMMITMENT, "source_url", ENG_142)]
+    assert ctx.links[2].record.actor.person == "dev"  # the task's assignee, through the identity map
+    assert "g8_get_task" not in [tool for _, tool, _ in gw.calls]  # already listed, not fetched again
+
+
+def test_direct_link_wins_and_each_record_is_read_once():
+    gw = FakeGateway(business_world("graph8:opportunity:" + G8_DEAL))
+    ctx = run(semantic.business_context(gw, {"activity_id": ENG_142}))
+    assert links(ctx) == [(CUSTOMER, "graph8_link", OPP), (OPP, "explicit_reference", ENG_142),
+                          (COMMITMENT, "source_url", ENG_142)]
+    assert [tool for _, tool, _ in gw.calls].count("g8_get_deal") == 1
+
+
+def test_commitment_from_a_meeting_links_the_conversation():
+    ctx = business_context(ENG_142, business_world(tasks=[fixture("graph8_task") | {"source_meeting_id": G8_MEETING}]))
+    assert [link.record.kind for link in ctx.links] == ["customer", "opportunity", "commitment", "conversation"]
+    assert links(ctx)[-1] == (MEETING, "graph8_link", COMMITMENT)
+
+
+def test_red_no_link_is_an_explicit_empty_result_and_nothing_is_guessed():
+    task = fixture("graph8_task")
+    near_misses = [task | {"source_url": "https://linear.app/example/issue/ENG-1420"},  # another issue
+                   task | {"id": TASK_2, "source_url": None, "title": "ENG-142: Ship SSO"},  # named in its title only
+                   task | {"id": TASK_3, "entity_type": None, "entity_id": None, "links": []}]  # no deal or company
+    gw = FakeGateway(business_world("For Example Customer Co", tasks=near_misses))  # the customer's name, no ID
+    ctx = run(semantic.business_context(gw, {"activity_id": ENG_142}))
+    assert (ctx.links, ctx.reason, ctx.incomplete) == ([], "no_link_found", [])
+    assert [tool for source, tool, _ in gw.calls if source == "graph8"] == ["g8_get_tasks"]
+
+
+def test_red_pr_links_through_the_issue_it_is_attached_to():
+    ctx = business_context(PR_15)
+    assert (ctx.activity_id, ctx.linked_issues) == (PR_15, [ENG_142])
+    assert links(ctx) == [(CUSTOMER, "graph8_link", OPP), (OPP, "graph8_link", COMMITMENT),
+                          (COMMITMENT, "source_url", ENG_142)]
+
+
+def test_pr_naming_an_issue_it_is_not_attached_to_has_no_link():
+    ctx = business_context(PR_15, business_world(attachments=()))
+    assert (ctx.linked_issues, ctx.links, ctx.reason) == ([], [], "no_link_found")
+
+
+def test_pr_issue_key_can_come_from_its_branch():
+    w = business_world(pr_fields={"title": "Ship SSO", "head": {"ref": "dev/eng-142-sso"}})
+    assert business_context(PR_15, w).linked_issues == [ENG_142]
+
+
+def test_task_created_from_the_pr_links_it_directly():
+    task = fixture("graph8_task") | {"source_url": "https://github.com/Octo-Dev/Reseau_Graph8/pull/15/files"}
+    ctx = business_context("github:pr:octo-dev/RESEAU_GRAPH8#15", business_world(tasks=[task], attachments=()))
+    assert (ctx.activity_id, ctx.linked_issues) == (PR_15, [])
+    assert links(ctx)[-1] == (COMMITMENT, "source_url", PR_15)
+
+
+def test_several_customers_come_back_in_a_stable_order():
+    second = fixture("graph8_task") | {"id": TASK_2, "entity_id": DEAL_2,
+                                       "links": [{"entity_type": "deal", "entity_id": DEAL_2}]}
+    deals = {DEAL_2: fixture("graph8_deal") | {"id": DEAL_2, "name": "Second Co - pilot", "company_id": 99}}
+    companies = {99: {"data": fixture("graph8_company")["data"] | {"id": 99, "name": "Second Co"}}}
+    found = [links(business_context(ENG_142, business_world(tasks=tasks, deals=deals, companies=companies)))
+             for tasks in ([fixture("graph8_task"), second], [second, fixture("graph8_task")])]
+    assert found[0] == found[1]
+    assert [aid for aid, _, _ in found[0]] == [CUSTOMER, "graph8:customer:99", "graph8:opportunity:" + DEAL_2, OPP,
+                                               "graph8:commitment:" + TASK_2, COMMITMENT]
+
+
+def test_tasks_are_read_across_pages_and_a_page_limit_is_reported(monkeypatch):
+    others = [fixture("graph8_task") | {"id": G8_TASK[:-12] + "%012d" % k, "source_url": None} for k in range(150)]
+    w = business_world(tasks=others + [fixture("graph8_task")])
+    assert links(business_context(ENG_142, w))[-1] == (COMMITMENT, "source_url", ENG_142)
+    monkeypatch.setattr(semantic, "MAX_PAGES", 1)
+    ctx = business_context(ENG_142, w)
+    assert (ctx.links, ctx.reason) == ([], "no_link_found")
+    assert [(g.source, g.tool, g.reason) for g in ctx.incomplete] == [("graph8", "g8_get_tasks", "page_limit")]
+
+
+def test_reference_to_a_missing_malformed_or_unlinked_record_is_reported_not_linked():
+    gone = G8_DEAL[:-12] + "00000000dead"
+    unlinked = fixture("graph8_task") | {"id": TASK_2, "entity_type": None, "entity_id": None, "links": []}
+    w = business_world("graph8:opportunity:%s graph8:deal:%s graph8:commitment:%s" % (gone, G8_DEAL, TASK_2),
+                       tasks=[unlinked])
+    ctx = business_context(ENG_142, w)
+    assert (ctx.links, ctx.reason) == ([], "no_link_found")
+    assert sorted((g.reason, g.detail.split(" ")[0]) for g in ctx.incomplete) == [
+        ("invalid_activity_id", "graph8:deal:" + G8_DEAL), ("not_found", "graph8:commitment:" + TASK_2),
+        ("not_found", "graph8:opportunity:" + gone)]
+
+
+@pytest.mark.parametrize("aid", ["github:commit:%s@%040x" % (RG, 1), OPP, "ENG-142", None])
+def test_only_an_issue_or_a_pr_is_accepted(aid):
+    gw = FakeGateway(business_world())
+    with pytest.raises(MCPError) as e:
+        run(semantic.business_context(gw, {"activity_id": aid}))
+    assert (e.value.code, e.value.data["kind"]) == (-32602, "invalid_activity_id")
+    assert gw.calls == []
+
+
+def test_unknown_work_item_is_not_found():
+    with pytest.raises(MCPError) as e:
+        business_context("linear:issue:ENG-9")
+    assert (e.value.code, e.value.data) == (-32008, {"kind": "not_found", "activity_id": "linear:issue:ENG-9"})
+
+
+def test_green_business_context_over_mcp_through_the_shipped_graph8_upstream():
+    w = business_world("graph8:opportunity:" + G8_DEAL)
+    w["graph8"]["g8_current_org"] = lambda a: "org"  # the shipped upstream establishes org context first
+    get_issue = w["linear"]["get_issue"]
+    w["linear"]["get_issue"] = lambda a: issue("ENG-7", "Chore", "started") if a["id"] == "ENG-7" else get_issue(a)
+    with MockUpstream(GH_TOKEN, stateless=False, script=w["github"]) as gh, \
+            MockUpstream(LIN_TOKEN, stateless=True, script=w["linear"]) as lin, \
+            MockUpstream(G8_TOKEN, stateless=True, script=w["graph8"]) as g8:
+        async def body(base, gw):
+            async with Client(sse_client(base + "/g8/%s/sse" % TOK), mode="legacy") as c:
+                tools = {t.name: t for t in (await c.list_tools()).tools}
+                return tools["get_business_context"], [
+                    await c.call_tool("get_business_context", {"activity_id": aid}) for aid in (PR_15, "linear:issue:ENG-7")]
+
+        tool, results = run(serving((gh, lin, g8), body, identities=PEOPLE, env={"RESEAU_GITHUB_SCOPE": LOGIN}))
+
+    for res in results:
+        assert not res.is_error
+        jsonschema.validate(res.structured_content, tool.output_schema)
+    linked, unlinked = (r.structured_content for r in results)
+    assert linked["linked_issues"] == [ENG_142]
+    assert [(link["activity_id"], link["link_type"], link["via"]) for link in linked["links"]] == [
+        (CUSTOMER, "graph8_link", OPP), (OPP, "explicit_reference", ENG_142), (COMMITMENT, "source_url", ENG_142)]
+    assert all(link["record"]["activity_id"] == link["activity_id"] for link in linked["links"])
+    assert (unlinked["links"], unlinked["reason"], unlinked["incomplete"]) == ([], "no_link_found", [])

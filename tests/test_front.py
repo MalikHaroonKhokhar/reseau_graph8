@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import socket
 
@@ -8,9 +9,9 @@ from mcp import Client
 from mcp.client.sse import sse_client
 
 from reseau import front
-from reseau.gateway import Gateway, Upstream
+from reseau.gateway import DEFAULT_UPSTREAMS, Gateway, Upstream
 from tests.mock_upstream import MockUpstream
-from tests.test_gateway import GH_TOKEN, LIN_TOKEN, assert_no_secret, run
+from tests.test_gateway import G8_TOKEN, GH_TOKEN, LIN_TOKEN, assert_no_secret, run
 
 TOK, TOK2 = "g8tok_" + "a" * 32, "g8tok_" + "b" * 32
 
@@ -22,13 +23,16 @@ def mocks():
 
 
 async def serving(mocks, body, tokens=(TOK,), identities=None, env=None):
-    """Gateway over the mocks, fronted by front.app on a loopback port; body(base_url) runs against it."""
-    gh, lin = mocks
-    ups = [Upstream("github", gh.url, "GITHUB_MCP_TOKEN"), Upstream("linear", lin.url, "LINEAR_API_KEY")]
+    """Gateway over the mocks (GitHub, Linear, and optionally Graph8 as shipped), fronted by front.app on a loopback
+    port; body(base_url) runs against it."""
+    gh, lin, *g8 = mocks
+    ups = [Upstream("github", gh.url, "GITHUB_MCP_TOKEN"), Upstream("linear", lin.url, "LINEAR_API_KEY")] + [
+        dataclasses.replace({u.name: u for u in DEFAULT_UPSTREAMS}["graph8"], url=m.url) for m in g8]
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     base = "http://127.0.0.1:%d" % sock.getsockname()[1]
-    async with Gateway(ups, {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN, **(env or {})}, identities) as gw:
+    tokens_env = {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN, "GRAPH8_API_KEY": G8_TOKEN}
+    async with Gateway(ups, {**tokens_env, **(env or {})}, identities) as gw:
         srv = front.uvicorn.Server(front.uvicorn.Config(front.app(gw, list(tokens)), log_level="warning",
                                                         access_log=False, lifespan="off"))
         async with anyio.create_task_group() as tg:

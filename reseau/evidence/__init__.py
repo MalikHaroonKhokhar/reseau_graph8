@@ -109,6 +109,11 @@ async def fetch_json(call_tool, source, tool, args, activity_id=None):
 
 async def get_evidence(call_tool, activity_id, index, now=None):
     """Fetch and normalize one record. call_tool = Gateway.call_tool (allowlist and redaction apply)."""
+    return (await fetch(call_tool, activity_id, index, now))[1]
+
+
+async def fetch(call_tool, activity_id, index, now=None):
+    """-> (the upstream payload that holds the record, the normalized record), for callers that read more of it."""
     source, kind_name, fields = parse(activity_id)
     kind = SOURCES[source][kind_name]
     tool = kind.tool(fields) if callable(kind.tool) else kind.tool
@@ -120,7 +125,7 @@ async def get_evidence(call_tool, activity_id, index, now=None):
             break
         record = kind.normalize(payload, fields, fetched_at)
         if record:
-            return resolve(record, index)
+            return payload, resolve(record, index)
         args = kind.next_page and kind.next_page(payload, args)
         if not args:
             break
