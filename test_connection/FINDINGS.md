@@ -385,7 +385,7 @@ In all three the stored record contained **no** `headers`/`auth`/`bearer_token` 
 
 **Limit of this test:** `/mcp/sse` answers a POST `initialize` with `text/event-stream` and never emits an `event: endpoint` on GET, so it is the Streamable-HTTP handler on a path, not a legacy-SSE endpoint. Transport alone can explain all three failures, so this does not isolate the header question — it only shows the field is unstored and inert.
 
-**The clean positive control is the Réseau gateway itself**, which is real legacy SSE (like CoinGecko, which emits `event: endpoint` and connects: `success: true, tools_count: 2`). Once it is publicly reachable: `/g8/<token>/sse` should connect (credential in the path) while the same URL without the path token, with the credential supplied only via `headers`, should fail. That pair settles it definitively.
+**The clean positive control is the Réseau gateway itself**, which is real legacy SSE (like CoinGecko, which emits `event: endpoint` and connects: `success: true, tools_count: 2`). Once it is publicly reachable: `/g8/<token>/sse` should connect (credential in the path) while the same URL without the path token, with the credential supplied only via `headers`, should fail. That pair settles it definitively. **Settled by Run 6g** with a recording server instead: none of these fields reaches the wire.
 
 ## Run 6c — transport isolated on one server (2026-09-27)
 
@@ -453,3 +453,27 @@ Every claim above was re-run live. Ten held as written; two were wrong and two n
 **Provenance note:** the "It is closed to those two here" sentence is the OpenAPI description for `POST /voice/mcp-servers` (`be.graph8.com/api/v1/openapi.json`); it reaches readers through the rendered operation page at `docs.graph8.com/developers/api-reference/operations/create_mcp_server_voice_mcp_servers_post/`, which is where it was first read here.
 
 **Also confirmed independently:** the 422 enum (five spellings), the CoinGecko same-host A/B (both paths serve the identical two tools, `execute` and `search_docs`, with no auth), the silently-discarded canary fields, GitHub and Linear both 401-with-Bearer-challenge on Streamable HTTP with Linear's `/sse` at 404, and the inbound protected-resource metadata pointing at `auth.graph8.com/oauth/2.1`.
+
+## Run 6g — no credential field reaches the wire (`spikes/claims_check/headers_probe.py`, 2026-09-27)
+
+Closes the gap Run 6b left open: that run showed `headers` is inert, but its target couldn't connect anyway. Here the
+target is a **no-auth legacy-SSE server that records every request header** (1 tool, `ping`), served over a
+localhost.run tunnel, so a connection succeeds regardless of the fields and the recording shows exactly what Graph8 sends.
+Two registrations, each `/test`ed, then deleted and proven gone:
+
+| case | `/test` | requests | header names received | canaries received |
+|---|---|---|---|---|
+| control, no extra fields | `success: true, tools_count: 1` | 8 | 10 | none |
+| `headers`, `http_headers`, `extra_headers`, `request_headers`, `auth`, `bearer_token`, `api_key`, `token`, `oauth_client_id`, each with its own canary | `success: true, tools_count: 1` | 8 | **the same 10** | **none** |
+
+The 10 are `accept`, `accept-encoding`, `baggage`, `cache-control`, `connection`, `content-length`, `content-type`, `host`,
+`sentry-trace`, `user-agent`, on the `GET /sse` and every message `POST`. No `Authorization`, no `X-Canary-*` header, and
+no canary value anywhere. The `headers` case included `Authorization: Bearer <canary>`.
+
+**Verdict:** a remote (`sse`) registration has no way to send a credential. Extra fields get a 201, are not stored, and
+change nothing on the wire. Unlike "not stored or echoed" (Run 6f), this rests on what reached the server, not on what
+Graph8 reports back.
+
+Note: a Cloudflare quick tunnel (`trycloudflare.com`) buffers `text/event-stream`, so the handshake never completes
+through it (`/test` → 502). Use localhost.run, as in the README.
+
