@@ -46,6 +46,17 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   merged PRs and commits per team member and in total, and lists the team's blocked issues. Every count comes
   with its activity_ids and always equals their number. An issue is blocked when a Linear blocked-by relation
   points at an open issue; the answer names the blocker and the open PRs it waits on.
+- **Why a task matters.** `get_business_context(activity_id)` takes a Linear issue or GitHub PR and returns the
+  Graph8 customers, opportunities, commitments and conversations linked to it. Each comes with its activity_id and
+  a `link_type`:
+  - `source_url`: a Graph8 task, linked to a deal or company, was created from the issue or PR;
+  - `explicit_reference`: the issue's description names the record's activity_id, e.g. `graph8:opportunity:<id>`;
+  - `graph8_link`: Graph8 links it to the record named in `via`, such as the task's deal or the deal's company.
+
+  A PR links through the Linear issues it is attached to. Nothing is inferred from names: with no link, the answer
+  is empty, with `reason: "no_link_found"`. Known gap: Linear can't look an issue up by attachment, so a PR is
+  matched to the issues whose keys appear in its title, body or branch. A PR attached to an issue by hand, with no
+  key in its text, isn't found.
 - **GitHub scope is a permission.** `RESEAU_GITHUB_SCOPE` is the complete list of GitHub owners and repos
   the gateway may read: the raw `github_*` tools, `get_evidence` and the semantic tools alike. A call for
   any other repo is refused before it reaches GitHub (`-32012 out_of_scope`), and an org's repos are never
@@ -182,7 +193,7 @@ to port 8080.
 | `reseau/gateway.py` | Upstream side: credentials, sessions, retries, tool prefixing, allowlists, redaction |
 | `reseau/front.py` | Graph8-facing side: legacy SSE server and token auth |
 | `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source (GitHub, Linear, Graph8) |
-| `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context` and `get_team_summary`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues and team membership are resolved. |
+| `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context`, `get_team_summary` and `get_business_context`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues, team membership and work↔business links are resolved. |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
 | `reseau/workflows.py` | Graph8 workflows: the Start My Day and daily report definitions, prompts and triggers |
 | `reseau/verify.py` | The verifiers every workflow reply passes: citations, counts, blockers |

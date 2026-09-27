@@ -740,7 +740,7 @@ def test_merged_surface_routes_each_name_to_its_upstream(mocks):
             return names, out, e.value
 
     names, out, err = run(go())
-    assert len(names) == len(set(names)) == 19  # 7 per upstream + get_evidence and the 4 semantic tools
+    assert len(names) == len(set(names)) == 20  # 7 per upstream + get_evidence and the 5 semantic tools
     # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
     assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
                    "github_list_releases": "list_releases@mock-stateful",
@@ -795,7 +795,7 @@ def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
 
     names, raw, exposed, internal_by_client, internal, ok, health = run(go())
     assert names == ["linear_list_issues", "get_evidence", "get_person_activity", "get_my_day_context",
-                     "get_project_context", "get_team_summary"]
+                     "get_project_context", "get_team_summary", "get_business_context"]
     assert (raw.code, raw.data["kind"]) == (-32007, "tool_not_allowed")
     assert exposed.data["kind"] == "unknown_tool"
     # an internal tool is callable by Réseau's own tools only: not listed, not routed for a client
