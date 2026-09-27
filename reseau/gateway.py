@@ -42,6 +42,7 @@ UPSTREAM_UNAVAILABLE = -32003
 UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
+TOOL_NOT_ALLOWED = -32007
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -59,13 +60,24 @@ class Upstream:
     # Prepended to every raw tool name this upstream exposes; None = "<name>_". Raw names collide across
     # upstreams (GitHub and Linear both have list_issues, list_releases: FINDINGS.md Run 2).
     prefix: str | None = None
+    # Raw tool names this upstream may list and call; None = pass everything through. A blocked call is
+    # rejected before it reaches the upstream. The bootstrap tool is called internally either way.
+    allow: frozenset[str] | None = None
 
 
+# Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
+# plus a minimal allowlist for the semantic tools (HAR-100, HAR-101, HAR-109); grow it from those tickets.
 DEFAULT_UPSTREAMS = (
-    Upstream("github", "https://api.githubcopilot.com/mcp/", "GITHUB_MCP_TOKEN"),
-    Upstream("linear", "https://mcp.linear.app/mcp", "LINEAR_API_KEY"),
+    Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
+             allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
+                              "list_issues", "issue_read"})),
+    Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
+             allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
+                              "get_project"})),
+    # ponytail: Graph8 has no known read-only endpoint; the allowlist alone keeps its 126 tools out.
     Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE,
-             prefix=""),  # Graph8 already names its tools g8_*
+             prefix="",  # Graph8 already names its tools g8_*
+             allow=frozenset({"g8_current_org"})),
 )
 
 
@@ -164,6 +176,10 @@ def install_log_redaction(secrets=SECRETS):
 
     logging.Logger.makeRecord = make_record
     _log_redaction_installed = True
+
+
+def allowed(upstream, raw):
+    return upstream.allow is None or raw in upstream.allow
 
 
 def exposed_name(upstream, raw):
@@ -409,11 +425,14 @@ class Gateway:
                 cursor = page.next_cursor
                 if not cursor:
                     return tools
-        return [scrub_model(t, self.secrets) for t in await self._use(name, op)]
+        up = self._conn(name).upstream
+        return [scrub_model(t, self.secrets) for t in await self._use(name, op) if allowed(up, t.name)]
 
     async def call_tool(self, name, tool, arguments=None):
         c = self._conn(name)
         up = c.upstream
+        if not allowed(up, tool):
+            raise UpstreamError(TOOL_NOT_ALLOWED, "%s: tool %r is not allowlisted" % (name, tool), name, "tool_not_allowed")
         args = arguments or {}
 
         async def establish(client, stale_gen):

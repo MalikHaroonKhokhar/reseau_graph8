@@ -254,3 +254,23 @@ Consequences:
 Also still open for Graph8: the swallowed `TaskGroup` cause, and per-server tool prefixing (`list_issues` and `list_releases` collide).
 
 Cleanup: every `reseau-probe-*` registration was deleted; the final `GET /api/v1/workflows/mcp-servers` returned `{"servers":[],"total":0}` (both runs).
+
+---
+
+# Run 4 — read-only endpoints and the allowlist (HAR-95, 2026-09-27)
+
+## Linear `/mcp/readonly` — PASS with a static API key
+`https://mcp.linear.app/mcp/readonly` with the `lin_api_…` key as `Authorization: Bearer`: initialize 200, tools/list → **35 tools** (vs **59** on `/mcp`). Every tool is `get_*`, `list_*`, `search_documentation` or `extract_images`. None of them write. The 24 dropped tools are the writers: `save_*` (issue, comment, document, project, milestone, release, release note, status update, labels), `create_*`, `delete_*`, `retire_*`/`restore_*` labels, `share_issue`/`unshare_issue`, `mark_notification`, `prepare_attachment_upload`. `list_teams` → OK.
+
+GitHub `/mcp/readonly` re-listed: 27 tools, as before. It includes `run_secret_scanning`, which the allowlist keeps out.
+
+## Gateway default surface
+The default config uses read-only endpoints for GitHub and Linear. Graph8 has no known read-only variant. Each provider also has an allowlist, seeded from the semantic-tool tickets (HAR-100/101/109):
+
+| upstream | endpoint | upstream tools | exposed |
+|---|---|---|---|
+| GitHub | `/mcp/readonly` | 27 | 7: `get_me`, `list_commits`, `get_commit`, `list_pull_requests`, `pull_request_read`, `list_issues`, `issue_read` |
+| Linear | `/mcp/readonly` | 35 | 6: `list_teams`, `list_issues`, `get_issue`, `list_comments`, `list_projects`, `get_project` |
+| Graph8 | `/mcp/` | 126 | 1: `g8_current_org` |
+
+Live smoke (`python -m reseau.gateway`): all three connect and return 7/6/1 tools. `get_me`, `list_teams` and `g8_current_org` all return OK. **230 → 14 tools** per agent request. A call to a tool not on the allowlist gets `-32007 tool_not_allowed` and is never sent upstream.
