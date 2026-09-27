@@ -149,7 +149,7 @@ def test_green_both_upstreams_list_and_call(mocks, caplog):
     caplog.set_level(logging.DEBUG)
     health, out = run(go())
     assert health == {"github": {"ok": True, "error": None}, "linear": {"ok": True, "error": None}}
-    names = ["echo", "slow", "echo_struct", "list_issues", "list_releases", "rpc_fail"]
+    names = ["echo", "slow", "echo_struct", "list_issues", "list_releases", "create_issue", "rpc_fail"]
     assert out == {"github": (names, "echo:github"), "linear": (names, "echo:linear")}
     # session id carried only when issued: stateful mock gets it after initialize, stateless never does
     assert any("mcp-session-id" in h for _, h in gh.seen)
@@ -493,7 +493,7 @@ def test_merged_surface_routes_each_name_to_its_upstream(mocks):
             return names, out, e.value
 
     names, out, err = run(go())
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 14
     # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
     assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
                    "github_list_releases": "list_releases@mock-stateful",
@@ -525,3 +525,36 @@ def test_collision_fails_startup_and_closes_connections(mocks):
 
     run(go())
     assert all(c.client is None and c.done.is_set() for c in gw.conns.values())
+
+
+# ---- tool allowlist (HAR-95) ----
+
+def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
+    _, lin = mocks
+    up = Upstream("linear", lin.url, "LINEAR_API_KEY", allow=frozenset({"list_issues"}))
+
+    async def go():
+        async with Gateway([up], {"LINEAR_API_KEY": LIN_TOKEN}) as gw:
+            names = [t.name for t in await gw.tools()]
+            with pytest.raises(UpstreamError) as raw:
+                await gw.call_tool("linear", "create_issue", {"title": "x"})
+            with pytest.raises(UpstreamError) as exposed:
+                await gw.call("linear_create_issue", {"title": "x"})
+            ok = (await gw.call("linear_list_issues")).content[0].text
+            return names, raw.value, exposed.value, ok, gw.health()
+
+    names, raw, exposed, ok, health = run(go())
+    assert names == ["linear_list_issues"]
+    assert (raw.code, raw.data["kind"]) == (-32007, "tool_not_allowed")
+    assert exposed.data["kind"] == "unknown_tool"
+    assert ok == "list_issues@mock-stateless"
+    assert lin.created == 0  # the blocked call never reached the upstream
+    assert health["linear"]["ok"]  # a blocked call is not an upstream failure
+
+
+def test_default_config_is_read_only_and_allowlisted():
+    from reseau.gateway import DEFAULT_UPSTREAMS
+    ups = {u.name: u for u in DEFAULT_UPSTREAMS}
+    assert ups["github"].url.endswith("/mcp/readonly") and ups["linear"].url.endswith("/mcp/readonly")
+    assert all(u.allow is not None for u in DEFAULT_UPSTREAMS)
+    assert ups["graph8"].bootstrap_tool in ups["graph8"].allow

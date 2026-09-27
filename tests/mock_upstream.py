@@ -19,6 +19,7 @@ class MockUpstream:
         self.fail_status = None  # set to e.g. 503 to fail requests after auth
         self.fail_times = None  # with fail_status: fail only the next N requests (None = every request)
         self.in_flight = self.peak = 0  # concurrent `slow` tool executions
+        self.created = 0
         self.seen = []  # (method, headers dict) of every request that passed auth
         server = MCPServer("mock-" + ("stateless" if stateless else "stateful"))
 
@@ -61,6 +62,11 @@ class MockUpstream:
         @server.tool()
         def list_releases() -> str:
             return "list_releases@" + server.name
+
+        @server.tool()
+        def create_issue(title: str) -> str:  # write tool; created counts calls that got through
+            self.created += 1
+            return "created:" + title
 
         @server.tool()
         def rpc_fail(text: str) -> str:
