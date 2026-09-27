@@ -51,6 +51,11 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   any other repo is refused before it reaches GitHub (`-32012 out_of_scope`), and an org's repos are never
   read or shown until the org is listed. GitHub search, which could reach any repo the token sees, is
   internal to the semantic tools, which add the scope to every query; clients can't call it.
+- **Start My Day: a briefing where every sentence is checked.** A Graph8 workflow calls `get_my_day_context`
+  on the registered gateway, and an agent writes Focus today, Needs attention and Yesterday as sentences, each
+  with the activity_ids it cites. The trigger returns the briefing only if every sentence cites at least one
+  ID the tool returned for that section. A section with no activity must say "Nothing to report." and nothing
+  else, and a section with activity can't say it. A reply that fails the check is retried once, then refused.
 
 ## Setup
 
@@ -72,6 +77,7 @@ cp .env.example .env   # then fill it in
 | `RESEAU_TEAM` | Optional. The Linear team (name, key or ID) that `get_team_summary` covers. Members not in `RESEAU_IDENTITIES` are listed as unmapped and not counted. |
 | `RESEAU_TIMEZONE` | Optional. IANA timezone (e.g. `Asia/Karachi`) that sets where a day starts for `get_person_activity`'s and `get_team_summary`'s date and for "yesterday". Default `UTC`. |
 | `RESEAU_GATEWAY_TOKEN` | Secret Graph8 uses to reach the gateway. Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Comma-separate several to rotate. |
+| `RESEAU_START_MY_DAY` | The Start My Day workflow's `action_id`, printed by `python -m reseau.workflows setup`. |
 
 ## Run
 
@@ -94,6 +100,20 @@ uv run python -m reseau.register_graph8 https://<public-gateway-host> --keep   #
 The script counts the gateway's tools itself, registers `https://<host>/g8/<token>/sse` as an `sse` server,
 and checks that Graph8's `/test` returns `success: true` with the same `tools_count`. Without `--keep`, it
 then deletes the record and verifies that it's gone.
+
+## Start My Day
+
+```sh
+uv run python -m reseau.register_graph8 https://<public-gateway-host> --keep   # once
+uv run python -m reseau.workflows setup          # creates the voice agent and workflow, prints RESEAU_START_MY_DAY=...
+uv run python -m reseau.workflows start-my-day   # runs it and prints the verified briefing (~12 credits a run)
+```
+
+The dashboard calls `reseau.workflows.start_my_day(g8, action_id)` and gets back
+`{"execution_id", "date", "sections": {"focus" | "needs_attention" | "yesterday": [{"text", "activity_ids"}]}, "incomplete"}`,
+or a `WorkflowError` listing what failed. `incomplete` is the tool's own list of anything that may be
+missing. `workflows.check(briefing, sources)` is the citation verifier; the daily report and Ask Réseau use it
+as well.
 
 ## Security
 
@@ -120,6 +140,10 @@ uv run pytest
 
 The tests run against local mock MCP servers on loopback and need no network.
 
+Live check of Start My Day. Graph8 runs the real workflow against the gateway served over the test fixtures,
+3 times plus once on an empty day. It is billable, and it deletes everything it creates:
+`uv run python -m tests.live_start_my_day https://<public host>`, with a tunnel open to port 8080.
+
 ## Layout
 
 | Path | Contents |
@@ -129,6 +153,7 @@ The tests run against local mock MCP servers on loopback and need no network.
 | `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source (GitHub, Linear, Graph8) |
 | `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context` and `get_team_summary`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues and team membership are resolved. |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
+| `reseau/workflows.py` | Graph8 workflows: the Start My Day definition, prompt and trigger, and the citation verifier they share |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |
 | `upstream/` | Fixes proposed to Graph8, handed off as tickets (tests: `uv run pytest upstream/<name>`) |
