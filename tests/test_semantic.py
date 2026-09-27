@@ -498,7 +498,7 @@ def team_world():
 
     lin |= {"list_issues": issues, "list_users": list_users, "get_issue": lambda a: extra.get(a["id"]) or get_issue(a)}
     gh |= {"search_pull_requests": search, "pull_request_read": read, "list_commits": lambda a: list_commits(a) + (
-        [stranger] if (a["repo"], a["sha"], a.get("page", 1)) == ("ui-critic", "main", 1) else [])}
+        [stranger] if (a["repo"], a["sha"], a.get("page", 1), a.get("author")) == ("ui-critic", "main", 1, None) else [])}
     return w
 
 
