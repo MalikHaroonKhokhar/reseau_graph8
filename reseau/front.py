@@ -59,8 +59,9 @@ def mcp_server(gw):
 
 
 def app(gw, tokens):
-    """ASGI app: /g8/<token>/sse and /g8/<token>/messages/. Anything else, a bad token included, is a 404,
-    so a caller without the token learns nothing about which paths exist."""
+    """ASGI app: /g8/<token>/sse and /g8/<token>/messages/. / and /ping answer "ok" (Render's health check and
+    the keep-alive pinger). Anything else, a bad token included, is a 404, so a caller without the token learns
+    nothing about which paths exist."""
     gateway.SECRETS.update(tokens)  # the SDK logs the endpoint event (path with token) at DEBUG
     gateway.install_log_redaction()
     server = mcp_server(gw)
@@ -69,6 +70,8 @@ def app(gw, tokens):
     async def asgi(scope, receive, send):
         if scope["type"] != "http":
             return
+        if scope["path"] in ("/", "/ping"):
+            return await Response("ok")(scope, receive, send)
         parts = scope["path"].split("/", 3)  # "", "g8", token, rest
         if len(parts) != 4 or parts[1] != "g8" or not valid(parts[2], tokens):
             log.warning("rejected unauthenticated %s from %s", scope["method"], (scope.get("client") or ("?",))[0])

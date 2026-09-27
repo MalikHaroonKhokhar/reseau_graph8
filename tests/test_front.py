@@ -79,6 +79,14 @@ def test_red_unauthenticated_is_rejected_everywhere(mocks, caplog):
     assert TOK not in caplog.text
 
 
+def test_health_paths_answer_ok_and_nothing_else(mocks):
+    async def body(base, gw):
+        async with httpx2.AsyncClient() as http:
+            return [((r := await http.get(base + p)).status_code, r.text) for p in ("/", "/ping", "/ping/", "/pong")]
+
+    assert run(serving(mocks, body)) == [(200, "ok"), (200, "ok"), (404, "Not Found"), (404, "Not Found")]
+
+
 def test_rotation_accepts_every_listed_token(mocks):
     async def body(base, gw):
         return [(await list_and_call(base + "/g8/%s/sse" % t))[1] for t in (TOK, TOK2)]
