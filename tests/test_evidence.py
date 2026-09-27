@@ -19,6 +19,7 @@ SHA = "a516b748f6e62cef147c8229afe18b1538ddbb55"
 COMMIT_ID = "github:commit:octo-dev/reseau_graph8@" + SHA
 COMMENT_ID = "github:review_comment:modelcontextprotocol/python-sdk#3583/4102813786"
 ISSUE_ID = "linear:issue:HAR-98"
+REVIEW_ID = "github:review:octo-dev/sandbox#13/4779069846"
 PEOPLE = {"dev": {"github": "octo-dev", "linear": "00000000-0000-4000-8000-000000000001"}}
 
 
@@ -66,6 +67,15 @@ def test_linear_issue_fixture_produces_record():
         "2026-09-26T13:26:59.043Z", "2026-09-27T04:23:01.104Z", AT)
 
 
+def test_review_fixture_produces_record():
+    assert normalize(REVIEW_ID, fixture("github_reviews")) == Record(
+        REVIEW_ID, "github", "review", "4779069846",
+        "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-4779069846",
+        "The changes in expense.py replace the typing import.", Actor("github", "octo-dev"),
+        "2026-07-25T09:51:20Z", "2026-07-25T09:51:20Z", AT)
+    assert normalize(REVIEW_ID.replace("4779069846", "1"), fixture("github_reviews")) is None
+
+
 def test_commit_without_linked_account_is_name_only():
     c = fixture("github_commit")
     c["author"] = None
@@ -74,7 +84,7 @@ def test_commit_without_linked_account_is_name_only():
 
 # ---- activity_id ----
 
-@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, ISSUE_ID])
+@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, REVIEW_ID, ISSUE_ID])
 def test_activity_id_round_trip(aid):
     assert evidence.format_id(*evidence.parse(aid)) == aid
 
@@ -137,6 +147,15 @@ def test_review_comment_found_on_a_later_page():
     rec = run(evidence.get_evidence(call, COMMENT_ID.replace("4102813786", "7"), {}, now))
     assert rec.source_id == "7" and rec.fetched_at == AT
     assert calls[1]["after"] == page1["pageInfo"]["endCursor"] and "after" not in calls[0]
+
+
+def test_review_found_on_the_next_numbered_page(monkeypatch):
+    monkeypatch.setattr(github, "PER_PAGE", 2)  # the 2-review fixture is then a full page
+    call, calls = fake((json.dumps(fixture("github_reviews")), False), ('[{"id": 7, "state": "APPROVED", '
+        '"html_url": "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-7", "submitted_at": null}]', False))
+    rec = run(evidence.get_evidence(call, REVIEW_ID.replace("4779069846", "7"), {}))
+    assert (rec.activity_id, rec.title) == (REVIEW_ID.replace("4779069846", "7"), "APPROVED")
+    assert [c.get("page") for c in calls] == [None, 2]
 
 
 def test_review_comment_missing_after_last_page_is_not_found():

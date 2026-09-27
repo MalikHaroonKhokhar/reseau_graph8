@@ -27,7 +27,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-from reseau import evidence, outbound
+from reseau import evidence, outbound, semantic
 
 log = logging.getLogger("reseau.gateway")
 
@@ -44,6 +44,7 @@ CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
 # -32008, -32009, -32010: reseau/evidence (not found, upstream error, search incomplete)
+# -32011: reseau/semantic (unmapped person)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -71,7 +72,7 @@ class Upstream:
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
-                              "list_issues", "issue_read"})),
+                              "list_issues", "issue_read", "search_pull_requests", "search_repositories"})),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
                               "get_project"})),
@@ -319,6 +320,7 @@ class Gateway:
     def __init__(self, upstreams=DEFAULT_UPSTREAMS, env=os.environ, identities=None):
         self.env = env
         self.identities = evidence.load_identities(env) if identities is None else evidence.identity_index(identities)
+        self.tz = semantic.load_tz(env)
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
@@ -469,7 +471,7 @@ class Gateway:
     async def tools(self):
         """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream
         is left out (health() says why), and so is one that answers tools/list with its own error: one bad
-        upstream never takes down the surface or startup. Réseau's own get_evidence comes last.
+        upstream never takes down the surface or startup. Réseau's own tools come last.
         Raises ValueError on a name collision."""
         listed = []
         for c in self.conns.values():
@@ -479,10 +481,11 @@ class Gateway:
                 if not isinstance(exc, UpstreamError):
                     log.warning("upstream %s tools/list failed: %s", c.upstream.name, exc.message)
         tools, self.routes = merge_tools(listed)
-        if evidence.TOOL.name in self.routes:
-            raise ValueError("tool name collision: %r from %s/%s and reseau"
-                             % (evidence.TOOL.name, *self.routes[evidence.TOOL.name]))
-        return tools + [evidence.TOOL]
+        own = [evidence.TOOL, *semantic.TOOLS]
+        for t in own:
+            if t.name in self.routes:
+                raise ValueError("tool name collision: %r from %s/%s and reseau" % (t.name, *self.routes[t.name]))
+        return tools + own
 
     async def call(self, name, arguments=None):
         """tools/call by exposed name: route to the owning upstream with the raw name. An unknown name
@@ -490,6 +493,8 @@ class Gateway:
         if name == evidence.TOOL.name:
             return evidence.as_result(await evidence.get_evidence(
                 self.call_tool, (arguments or {}).get("activity_id"), self.identities))
+        if name in semantic.HANDLERS:
+            return evidence.as_result(await semantic.HANDLERS[name](self, arguments or {}))
         if name not in self.routes:
             await self.tools()  # ponytail: every unknown name re-lists all upstreams; rate-limit if clients spam typos
         if name not in self.routes:

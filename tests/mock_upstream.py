@@ -1,12 +1,15 @@
 """Local Streamable HTTP MCP servers for integration tests: bearer-token gated, stateful (issues
 Mcp-Session-Id, like GitHub) or stateless (no session id, like Linear). Loopback only, no network."""
+import json
 import pathlib
 import socket
 import threading
 import time
 
 import anyio
+import mcp.types as types
 import uvicorn
+from mcp.server.lowlevel import Server
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
@@ -14,8 +17,29 @@ from mcp.shared.exceptions import MCPError
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
+def scripted_result(script, name, args):
+    """script = {tool name: fn(arguments) -> JSON value}. A raised exception becomes an isError result with its
+    message, the way the real upstreams report tool failures."""
+    try:
+        text, is_error = json.dumps(script[name](args or {})), False
+    except Exception as e:
+        text, is_error = str(e), True
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=is_error)
+
+
+def scripted_app(script, stateless):
+    async def list_tools(ctx, params):
+        return types.ListToolsResult(tools=[types.Tool(name=n, input_schema={"type": "object"}) for n in script])
+
+    async def call_tool(ctx, params):
+        return scripted_result(script, params.name, params.arguments)
+
+    return Server("mock-scripted", on_list_tools=list_tools, on_call_tool=call_tool).streamable_http_app(
+        stateless_http=stateless)
+
+
 class MockUpstream:
-    def __init__(self, token, stateless, org_gate=False, evidence=False):
+    def __init__(self, token, stateless, org_gate=False, evidence=False, script=None):
         self.token = token
         self.org_ready = not org_gate  # Graph8-style gate: tools fail -32003 until g8_current_org is called
         self.org_calls = 0
@@ -102,7 +126,8 @@ class MockUpstream:
                     return fixture("linear_issue")
                 raise ToolError('{"error":"invalid_request","message":"Could not find referenced Issue.","status":400}')
 
-        app = server.streamable_http_app(stateless_http=stateless)
+        # script replaces every tool above with scripted_result's canned answers
+        app = scripted_app(script, stateless) if script else server.streamable_http_app(stateless_http=stateless)
 
         async def gate(scope, receive, send):
             if scope["type"] == "http":
