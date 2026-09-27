@@ -9,7 +9,7 @@ Run 5): neither challenges with HTML, and their caps (HOST_CAPS) are set from th
 RETRY SCOPE: only idempotent reads (GET/HEAD/OPTIONS) and the MCP handshake (SAFE_MCP_METHODS) are retried by
 default. tools/call and any other call with side effects is NOT retried here; business-level retry is out of scope.
 Pass retry=True only when you know the call is safe to repeat. (The gateway's async transport also retries
-tools/call on 429 for read-only upstreams; see gateway._Reliable.)
+tools/call on read-only upstreams, on 429 and on network errors; see gateway._Reliable.)
 """
 import http.client
 import json
