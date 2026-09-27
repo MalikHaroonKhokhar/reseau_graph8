@@ -1,5 +1,6 @@
 """Local Streamable HTTP MCP servers for integration tests: bearer-token gated, stateful (issues
 Mcp-Session-Id, like GitHub) or stateless (no session id, like Linear). Loopback only, no network."""
+import pathlib
 import socket
 import threading
 import time
@@ -7,11 +8,14 @@ import time
 import anyio
 import uvicorn
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
+
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
 class MockUpstream:
-    def __init__(self, token, stateless, org_gate=False):
+    def __init__(self, token, stateless, org_gate=False, evidence=False):
         self.token = token
         self.org_ready = not org_gate  # Graph8-style gate: tools fail -32003 until g8_current_org is called
         self.org_calls = 0
@@ -71,6 +75,32 @@ class MockUpstream:
         @server.tool()
         def rpc_fail(text: str) -> str:
             raise MCPError(-32000, "upstream failed on " + text, {"input": text})
+
+        if evidence:  # GitHub and Linear read tools answering with the recorded fixtures, or their live not-found text
+            def fixture(name):
+                return (FIXTURES / (name + ".json")).read_text()
+
+            @server.tool()
+            def pull_request_read(method: str, owner: str, repo: str, pullNumber: int, perPage: int | None = None,
+                                  after: str | None = None) -> str:
+                if (method, owner, repo, pullNumber) == ("get", "octo-dev", "reseau_graph8", 15):
+                    return fixture("github_pr")
+                if (method, owner, repo, pullNumber) == ("get_review_comments", "modelcontextprotocol", "python-sdk", 3583):
+                    return fixture("github_review_comments") if after is None else '{"review_threads":[],"pageInfo":{}}'
+                raise ToolError("failed to get pull request: GET https://api.github.com/repos/%s/%s/pulls/%d: "
+                                 "404 Not Found []" % (owner, repo, pullNumber))
+
+            @server.tool()
+            def get_commit(owner: str, repo: str, sha: str, detail: str = "stats") -> str:
+                if (owner, repo) == ("octo-dev", "reseau_graph8") and "a516b748f6e62cef147c8229afe18b1538ddbb55".startswith(sha):
+                    return fixture("github_commit")
+                raise ToolError("failed to get commit: %s: No commit found for SHA: %s" % (sha, sha))
+
+            @server.tool()
+            def get_issue(id: str) -> str:
+                if id == "HAR-98":
+                    return fixture("linear_issue")
+                raise ToolError('{"error":"invalid_request","message":"Could not find referenced Issue.","status":400}')
 
         app = server.streamable_http_app(stateless_http=stateless)
 

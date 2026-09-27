@@ -1,0 +1,29 @@
+{
+  "sha": "a516b748f6e62cef147c8229afe18b1538ddbb55",
+  "html_url": "https://github.com/octo-dev/reseau_graph8/commit/a516b748f6e62cef147c8229afe18b1538ddbb55",
+  "commit": {
+    "message": "HAR-99: concurrency, rate-limit and session probes; results in FINDINGS Run 5\n\n(body trimmed)",
+    "author": {
+      "name": "octo-dev",
+      "email": "dev@example.com",
+      "date": "2026-09-27T04:05:02Z"
+    },
+    "committer": {
+      "name": "octo-dev",
+      "email": "dev@example.com",
+      "date": "2026-09-27T04:07:19Z"
+    }
+  },
+  "author": {
+    "login": "octo-dev",
+    "id": 1000001,
+    "profile_url": "https://github.com/octo-dev",
+    "avatar_url": "https://avatars.githubusercontent.com/u/1000001?v=4"
+  },
+  "committer": {
+    "login": "octo-dev",
+    "id": 1000001,
+    "profile_url": "https://github.com/octo-dev",
+    "avatar_url": "https://avatars.githubusercontent.com/u/1000001?v=4"
+  }
+}

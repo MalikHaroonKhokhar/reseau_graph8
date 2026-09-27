@@ -1,0 +1,119 @@
+"""Normalized work model with provenance (HAR-98): activity_ids, identity mapping, get_evidence.
+
+activity_id = "<source>:<kind>:<key>", e.g. github:pr:o/r#9, github:commit:o/r@<sha>,
+github:review_comment:o/r#9/<comment id>, linear:issue:ENG-142. A commit carries its repo because
+get_commit can't resolve a bare SHA. A new source (graph8, HAR-108) is one more module in SOURCES.
+
+Identities come only from an explicit map (RESEAU_IDENTITIES = path to JSON:
+{"<person>": {"github": "<login>", "linear": "<Linear user id>"}}). No match -> identity "unmapped";
+nothing is inferred from names or emails (Linear's MCP exposes no email to match on).
+"""
+import dataclasses
+import json
+import os
+import re
+from datetime import datetime, timezone
+
+import mcp.types as types
+from mcp.shared.exceptions import MCPError
+
+from reseau.evidence import github, linear
+
+SOURCES = {"github": github.KINDS, "linear": linear.KINDS}
+IDENTITIES_ENV = "RESEAU_IDENTITIES"
+MAX_PAGES = 10  # review comments are found by paging; past 10 x 100 threads the search reports search_incomplete
+
+# Continues gateway.py's JSON-RPC code list.
+INVALID_ACTIVITY_ID = -32602  # JSON-RPC "invalid params"
+EVIDENCE_NOT_FOUND = -32008
+EVIDENCE_UPSTREAM_ERROR = -32009
+EVIDENCE_SEARCH_INCOMPLETE = -32010
+# The phrases the live upstreams use for a missing object (captured in this ticket's probes).
+UPSTREAM_NOT_FOUND = re.compile(r"404 Not Found|No commit found|Could not resolve to a|Could not find referenced")
+
+TOOL = types.Tool(
+    name="get_evidence",
+    description="Resolve an activity_id (e.g. github:pr:owner/repo#9, github:commit:owner/repo@<sha>, "
+                "github:review_comment:owner/repo#9/<comment id>, linear:issue:ENG-142) to its source record: "
+                "canonical URL, actor (with Réseau person, or identity 'unmapped'), timestamps and fetched_at.",
+    input_schema={"type": "object", "properties": {"activity_id": {"type": "string"}}, "required": ["activity_id"]},
+)
+
+
+def _error(code, kind, message, activity_id):
+    return MCPError(code, message, {"kind": kind, "activity_id": activity_id})
+
+
+def parse(activity_id):
+    """activity_id -> (source, kind, fields). Raises MCPError(invalid_activity_id)."""
+    source, _, rest = (activity_id if isinstance(activity_id, str) else "").partition(":")
+    kind_name, _, key = rest.partition(":")
+    kind = SOURCES.get(source, {}).get(kind_name)
+    m = kind and kind.regex.fullmatch(key)
+    if not m:
+        raise _error(INVALID_ACTIVITY_ID, "invalid_activity_id", "not a valid activity_id: %r" % activity_id, activity_id)
+    return source, kind_name, m.groupdict()
+
+
+def format_id(source, kind, fields):
+    return "%s:%s:%s" % (source, kind, SOURCES[source][kind].template.format(**fields))
+
+
+def load_identities(env=os.environ):
+    path = env.get(IDENTITIES_ENV)
+    return identity_index(json.load(open(path)) if path else {})
+
+
+def identity_index(people):
+    """{"person": {"github": login, ...}} -> {(source, id casefolded): person}. One identity, one person."""
+    index = {}
+    for person, ids in people.items():
+        for source, uid in ids.items():
+            key = (source, str(uid).casefold())
+            if index.get(key, person) != person:
+                raise ValueError("identity %s:%s is mapped to both %r and %r" % (source, uid, index[key], person))
+            index[key] = person
+    return index
+
+
+def resolve(record, index):
+    a = record.actor
+    person = a.id and index.get((a.source, a.id.casefold()))
+    if not person:
+        return record
+    return dataclasses.replace(record, actor=dataclasses.replace(a, person=person, identity="mapped"))
+
+
+async def get_evidence(call_tool, activity_id, index, now=None):
+    """Fetch and normalize one record. call_tool = Gateway.call_tool (allowlist and redaction apply)."""
+    source, kind_name, fields = parse(activity_id)
+    kind = SOURCES[source][kind_name]
+    fetched_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    args = kind.args(fields)
+    for _ in range(MAX_PAGES):
+        result = await call_tool(source, kind.tool, args)
+        text = "".join(c.text for c in result.content if c.type == "text")
+        if result.is_error:
+            if UPSTREAM_NOT_FOUND.search(text):
+                break
+            raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s" % (source, text[:500]), activity_id)
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s returned non-JSON" % (source, kind.tool),
+                         activity_id) from None
+        record = kind.normalize(payload, fields, fetched_at)
+        if record:
+            return resolve(record, index)
+        args = kind.next_page and kind.next_page(payload, args)
+        if not args:
+            break
+    else:  # pages remain unsearched: the record may exist, so never call it not_found
+        raise _error(EVIDENCE_SEARCH_INCOMPLETE, "search_incomplete",
+                     "%s: searched %d pages without finding it; more remain" % (activity_id, MAX_PAGES), activity_id)
+    raise _error(EVIDENCE_NOT_FOUND, "not_found", "no evidence found for %s" % activity_id, activity_id)
+
+
+def as_result(record):
+    data = dataclasses.asdict(record)
+    return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(data))], structured_content=data)

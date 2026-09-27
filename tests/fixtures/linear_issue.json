@@ -1,0 +1,57 @@
+{
+  "id": "HAR-98",
+  "uuid": "255ff355-dfb4-439d-8c0a-8b730432ba35",
+  "title": "Gateway: normalized work model with provenance, identity mapping, and get_evidence(activity_id)",
+  "description": "**Type:** Feature (infrastructure)\n\n(description trimmed)",
+  "priority": {
+    "value": 2,
+    "name": "High"
+  },
+  "url": "https://linear.app/acme/issue/HAR-98/gateway-normalized-work-model-with-provenance-identity-mapping-and-get",
+  "gitBranchName": "dev/har-98-gateway-normalized-work-model-with-provenance-identity",
+  "createdAt": "2026-09-26T13:26:59.043Z",
+  "updatedAt": "2026-09-27T04:23:01.104Z",
+  "archivedAt": null,
+  "completedAt": null,
+  "startedAt": "2026-09-27T04:23:01.084Z",
+  "canceledAt": null,
+  "dueDate": null,
+  "slaStartedAt": null,
+  "slaMediumRiskAt": null,
+  "slaHighRiskAt": null,
+  "slaBreachesAt": null,
+  "status": "In Progress",
+  "statusType": "started",
+  "labels": [
+    "Backend",
+    "Feature"
+  ],
+  "attachments": [],
+  "documents": [],
+  "stateHistory": [
+    {
+      "state": {
+        "id": "e043405a-6221-444e-8428-6d9fbd31fe10",
+        "name": "Backlog",
+        "type": "backlog"
+      },
+      "startedAt": "2026-09-26T13:26:59.043Z",
+      "endedAt": "2026-09-27T04:23:01.098Z"
+    },
+    {
+      "state": {
+        "id": "2dbbaa02-9602-4412-bedf-646bbf0ddc7b",
+        "name": "In Progress",
+        "type": "started"
+      },
+      "startedAt": "2026-09-27T04:23:01.098Z",
+      "endedAt": null
+    }
+  ],
+  "createdBy": "Dev Person",
+  "createdById": "00000000-0000-4000-8000-000000000001",
+  "project": "Réseau — Graph8 MCP Gateway",
+  "projectId": "7614c0fc-216b-46d2-af2c-e5ee7583edac",
+  "team": "Personal",
+  "teamId": "4bfe9a17-edc0-44af-a71f-3c5fe8573641"
+}
