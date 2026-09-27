@@ -1,5 +1,6 @@
-# Render Blueprint: the gateway on the free plan. Values marked sync: false are asked for when the Blueprint is
-# created; identities.json and projects.json are added as Secret Files, which Render mounts at /etc/secrets/.
+# Render Blueprint: the gateway and the dashboard, one service on the free plan. Values marked sync: false are asked
+# for when the Blueprint is created (added later: set them under the service's Environment); identities.json and
+# projects.json are added as Secret Files, which Render mounts at /etc/secrets/.
 services:
   - type: web
     name: reseau-gateway
@@ -20,6 +21,14 @@ services:
       - key: RESEAU_TEAM
         sync: false
       - key: RESEAU_TIMEZONE
+        sync: false
+      - key: RESEAU_DASHBOARD_PASSWORD
+        sync: false
+      - key: RESEAU_START_MY_DAY
+        sync: false
+      - key: RESEAU_DAILY_REPORT
+        sync: false
+      - key: RESEAU_ASK
         sync: false
       - key: RESEAU_IDENTITIES
         value: /etc/secrets/identities.json

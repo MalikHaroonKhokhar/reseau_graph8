@@ -58,10 +58,11 @@ def mcp_server(gw):
     return Server("reseau-gateway", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
-def app(gw, tokens):
-    """ASGI app: /g8/<token>/sse and /g8/<token>/messages/. / and /ping answer "ok" (Render's health check and
-    the keep-alive pinger). Anything else, a bad token included, is a 404, so a caller without the token learns
-    nothing about which paths exist."""
+def app(gw, tokens, site=None):
+    """ASGI app: /g8/<token>/sse and /g8/<token>/messages/. /ping (and / without a site) answers "ok" (Render's
+    health check and the keep-alive pinger). Anything else under /g8/, a bad token included, is a 404, so a caller
+    without the token learns nothing about which paths exist; any other path goes to `site` (the dashboard, behind
+    its own password) or is a 404 too."""
     gateway.SECRETS.update(tokens)  # the SDK logs the endpoint event (path with token) at DEBUG
     gateway.install_log_redaction()
     server = mcp_server(gw)
@@ -70,9 +71,11 @@ def app(gw, tokens):
     async def asgi(scope, receive, send):
         if scope["type"] != "http":
             return
-        if scope["path"] in ("/", "/ping"):
+        if scope["path"] == "/ping" or (scope["path"] == "/" and not site):
             return await Response("ok")(scope, receive, send)
         parts = scope["path"].split("/", 3)  # "", "g8", token, rest
+        if site and parts[1] != "g8":
+            return await site(scope, receive, send)
         if len(parts) != 4 or parts[1] != "g8" or not valid(parts[2], tokens):
             log.warning("rejected unauthenticated %s from %s", scope["method"], (scope.get("client") or ("?",))[0])
             return await Response("Not Found", status_code=404)(scope, receive, send)
@@ -89,10 +92,12 @@ def app(gw, tokens):
     return asgi
 
 
-async def serve(host, port, tokens):
+async def serve(host, port, tokens, dashboard=False):
     async with gateway.Gateway() as gw:
         log.info("gateway up: %s", {n: h["ok"] for n, h in gw.health().items()})
-        cfg = uvicorn.Config(app(gw, tokens), host=host, port=port, access_log=False, lifespan="off")
+        from reseau import dashboard as dash  # not at the top: dashboard -> register_graph8 -> front
+        site = dash.public(gw) if dashboard else None
+        cfg = uvicorn.Config(app(gw, tokens, site), host=host, port=port, access_log=False, lifespan="off")
         await uvicorn.Server(cfg).serve()
 
 
@@ -102,6 +107,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--dashboard", action="store_true", help="serve the dashboard on the same port, behind "
+                                                            "RESEAU_DASHBOARD_PASSWORD (Render)")
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(serve(a.host, a.port, load_tokens()))
+    asyncio.run(serve(a.host, a.port, load_tokens(), a.dashboard))

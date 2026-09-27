@@ -10,6 +10,9 @@ access log (which would print activity_ids) is off.
 
     python -m reseau.dashboard [--port 8081]     # needs the env of `python -m reseau.workflows` (README)
 
+Deployed (Render), public() serves it on the gateway's port instead (python -m reseau.front --dashboard): behind
+HTTP Basic auth (any user name, RESEAU_DASHBOARD_PASSWORD), answering Render's own host as well.
+
 API: POST /api/start-my-day {}, POST /api/daily-report {"date": "YYYY-MM-DD"}, POST /api/ask {"question"}: the
 workflow's result as reseau.workflows returns it. GET /api/evidence?activity_id=...: get_evidence's record.
 An error is {"error": {"kind", "message", "upstreams"?, "problems"?}}, kind one of:
@@ -20,7 +23,9 @@ An error is {"error": {"kind", "message", "upstreams"?, "problems"?}}, kind one 
 - not_configured (503), invalid_input (400/415), out_of_scope (403), not_found (404), upstream_error (502)
 """
 import argparse
+import base64
 import dataclasses
+import hmac
 import json
 import logging
 import os
@@ -43,6 +48,7 @@ log = logging.getLogger("reseau.dashboard")
 
 STATIC = pathlib.Path(__file__).parent / "static"
 HOSTS = ["127.0.0.1", "localhost"]
+PASSWORD_ENV = "RESEAU_DASHBOARD_PASSWORD"
 MAX_QUESTION = 500
 NAMES = {"github": "GitHub", "linear": "Linear", "graph8": "Graph8"}
 DOWN = {"missing_credential", "unauthorized", "unavailable", "context_not_established"}  # UpstreamError kinds
@@ -83,7 +89,7 @@ def unavailable(upstreams, what):
                    % (names, "are" if len(upstreams) > 1 else "is", what), upstreams=upstreams)
 
 
-def app(g8, get_evidence, down=lambda: [], env=os.environ):
+def app(g8, get_evidence, down=lambda: [], env=os.environ, hosts=HOSTS):
     """The ASGI app. g8(method, path, body) -> (status, data) calls Graph8 (graph8()); get_evidence(activity_id) ->
     Record; down() -> the upstreams the gateway can't reach now, named when a workflow fails."""
 
@@ -165,15 +171,44 @@ def app(g8, get_evidence, down=lambda: [], env=os.environ):
         Route("/api/ask", trigger(ask), methods=["POST"]),
         Route("/api/evidence", evidence_endpoint),
         Mount("/", StaticFiles(directory=STATIC, html=True)),
-    ], middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=HOSTS)])
+    ], middleware=[Middleware(TrustedHostMiddleware, allowed_hosts=hosts)])
+
+
+def site(gw, env=os.environ, hosts=HOSTS):
+    """app() over a running Gateway: Graph8 with GRAPH8_API_KEY, get_evidence and health through gw."""
+    key = gateway.resolve_credential(gateway.Upstream("graph8", register_graph8.BASE, "GRAPH8_API_KEY"), env)
+    gateway.SECRETS.add(key)
+    return app(graph8(key), lambda activity_id: evidence.get_evidence(gw.call_tool, activity_id, gw.identities),
+               lambda: [n for n, h in gw.health().items() if not h["ok"]], env, hosts)
+
+
+def public(gw, env=os.environ):
+    """site() for the internet: HTTP Basic auth (the browser asks; any user name, RESEAU_DASHBOARD_PASSWORD) in front
+    of every path, and Render's host (RENDER_EXTERNAL_HOSTNAME, set by Render) answered too."""
+    password = (env.get(PASSWORD_ENV) or "").strip()
+    if len(password) < 12:
+        raise SystemExit("%s must be set (>= 12 chars) to put the dashboard online" % PASSWORD_ENV)
+    gateway.SECRETS.add(password)
+    web = site(gw, env, HOSTS + [h for h in [env.get("RENDER_EXTERNAL_HOSTNAME")] if h])
+    want = password.encode()
+
+    async def asgi(scope, receive, send):
+        auth = dict(scope.get("headers") or []).get(b"authorization", b"")
+        try:
+            given = base64.b64decode(auth[6:], validate=True).partition(b":")[2] if auth[:6] == b"Basic " else b""
+        except ValueError:
+            given = b""
+        if not hmac.compare_digest(given, want):
+            return await Response("Sign in to see Réseau.", 401,
+                                  {"WWW-Authenticate": 'Basic realm="Reseau", charset="UTF-8"'})(scope, receive, send)
+        return await web(scope, receive, send)
+
+    return asgi
 
 
 async def serve(port):
-    key = gateway.resolve_credential(gateway.Upstream("graph8", register_graph8.BASE, "GRAPH8_API_KEY"))
-    gateway.SECRETS.add(key)
     async with gateway.Gateway() as gw:
-        web = app(graph8(key), lambda activity_id: evidence.get_evidence(gw.call_tool, activity_id, gw.identities),
-                  lambda: [n for n, h in gw.health().items() if not h["ok"]])
+        web = site(gw)
         log.info("dashboard on http://127.0.0.1:%d", port)
         await uvicorn.Server(uvicorn.Config(web, host="127.0.0.1", port=port, access_log=False,
                                             lifespan="off")).serve()
