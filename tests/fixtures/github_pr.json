@@ -1,0 +1,40 @@
+{
+  "number": 15,
+  "title": "HAR-99: gateway behaviour under concurrency and long-running sessions",
+  "body": "Spike. Re-runnable probe with results in FINDINGS Run 5.",
+  "state": "closed",
+  "draft": false,
+  "merged": true,
+  "mergeable_state": "unknown",
+  "html_url": "https://github.com/octo-dev/reseau_graph8/pull/15",
+  "user": {
+    "login": "octo-dev",
+    "id": 1000001,
+    "profile_url": "https://github.com/octo-dev",
+    "avatar_url": "https://avatars.githubusercontent.com/u/1000001?v=4"
+  },
+  "merged_by": "octo-dev",
+  "head": {
+    "ref": "feat/har-99",
+    "sha": "a516b748f6e62cef147c8229afe18b1538ddbb55",
+    "repo": {
+      "full_name": "octo-dev/reseau_graph8"
+    }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "22e5ef9b4b17bed26f8d7677ce38e5360fcfc40d",
+    "repo": {
+      "full_name": "octo-dev/reseau_graph8"
+    }
+  },
+  "additions": 340,
+  "deletions": 2,
+  "changed_files": 3,
+  "commits": 1,
+  "comments": 2,
+  "created_at": "2026-09-27T04:07:47Z",
+  "updated_at": "2026-09-27T04:20:00Z",
+  "closed_at": "2026-09-27T04:20:00Z",
+  "merged_at": "2026-09-27T04:19:59Z"
+}

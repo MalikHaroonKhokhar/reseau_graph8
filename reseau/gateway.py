@@ -27,7 +27,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-from reseau import outbound
+from reseau import evidence, outbound
 
 log = logging.getLogger("reseau.gateway")
 
@@ -43,6 +43,7 @@ UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
+# -32008, -32009: reseau/evidence (not found, upstream error)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -315,8 +316,9 @@ class Gateway:
     Each upstream's SDK client lives in its own owner task, so upstreams connect concurrently, close or
     reconnect in any order, and a transport crash ends only that upstream's task."""
 
-    def __init__(self, upstreams=DEFAULT_UPSTREAMS, env=os.environ):
+    def __init__(self, upstreams=DEFAULT_UPSTREAMS, env=os.environ, identities=None):
         self.env = env
+        self.identities = evidence.load_identities(env) if identities is None else evidence.identity_index(identities)
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
@@ -467,7 +469,8 @@ class Gateway:
     async def tools(self):
         """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream
         is left out (health() says why), and so is one that answers tools/list with its own error: one bad
-        upstream never takes down the surface or startup. Raises ValueError on a name collision."""
+        upstream never takes down the surface or startup. Réseau's own get_evidence comes last.
+        Raises ValueError on a name collision."""
         listed = []
         for c in self.conns.values():
             try:
@@ -476,11 +479,17 @@ class Gateway:
                 if not isinstance(exc, UpstreamError):
                     log.warning("upstream %s tools/list failed: %s", c.upstream.name, exc.message)
         tools, self.routes = merge_tools(listed)
-        return tools
+        if evidence.TOOL.name in self.routes:
+            raise ValueError("tool name collision: %r from %s/%s and reseau"
+                             % (evidence.TOOL.name, *self.routes[evidence.TOOL.name]))
+        return tools + [evidence.TOOL]
 
     async def call(self, name, arguments=None):
         """tools/call by exposed name: route to the owning upstream with the raw name. An unknown name
         re-lists once first, so a client whose tool list outlived a gateway restart still routes."""
+        if name == evidence.TOOL.name:
+            return evidence.as_result(await evidence.get_evidence(
+                self.call_tool, (arguments or {}).get("activity_id"), self.identities))
         if name not in self.routes:
             await self.tools()  # ponytail: every unknown name re-lists all upstreams; rate-limit if clients spam typos
         if name not in self.routes:

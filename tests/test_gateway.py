@@ -493,7 +493,7 @@ def test_merged_surface_routes_each_name_to_its_upstream(mocks):
             return names, out, e.value
 
     names, out, err = run(go())
-    assert len(names) == len(set(names)) == 14
+    assert len(names) == len(set(names)) == 15  # 7 per upstream + get_evidence
     # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
     assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
                    "github_list_releases": "list_releases@mock-stateful",
@@ -544,7 +544,7 @@ def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
             return names, raw.value, exposed.value, ok, gw.health()
 
     names, raw, exposed, ok, health = run(go())
-    assert names == ["linear_list_issues"]
+    assert names == ["linear_list_issues", "get_evidence"]
     assert (raw.code, raw.data["kind"]) == (-32007, "tool_not_allowed")
     assert exposed.data["kind"] == "unknown_tool"
     assert ok == "list_issues@mock-stateless"

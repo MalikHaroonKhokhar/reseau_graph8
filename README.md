@@ -21,6 +21,10 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
 - **Upstream credentials never leave the gateway.** Graph8 only ever sees a gateway token.
 - **Failures stay isolated.** A dead or unauthorized upstream is left out of the tool list; the others keep
   working.
+- **Evidence behind every claim.** Réseau's own `get_evidence(activity_id)` resolves `github:pr:owner/repo#9`,
+  `github:commit:owner/repo@<sha>`, `github:review_comment:owner/repo#9/<comment id>` or `linear:issue:ENG-142`
+  to a normalized record: canonical URL, actor, timestamps and `fetched_at`. A commit ID carries its repo
+  because GitHub can't look up a bare SHA.
 
 ## Setup
 
@@ -36,6 +40,7 @@ cp .env.example .env   # then fill it in
 | `GITHUB_MCP_TOKEN` | GitHub PAT (read scopes are enough) |
 | `LINEAR_API_KEY` | Linear API key (`lin_api_…`) |
 | `GRAPH8_API_KEY` | Graph8 org API key (`g8_live_…`). Used as an upstream and by the registration script. |
+| `RESEAU_IDENTITIES` | Optional. Path to a JSON map of people to their upstream IDs, e.g. `{"ana": {"github": "ana-gh", "linear": "<Linear user id>"}}`. Actors not in the map are reported as `unmapped`, never guessed. |
 | `RESEAU_GATEWAY_TOKEN` | Secret Graph8 uses to reach the gateway. Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Comma-separate several to rotate. |
 
 ## Run
@@ -91,6 +96,7 @@ The tests run against local mock MCP servers on loopback and need no network.
 |---|---|
 | `reseau/gateway.py` | Upstream side: credentials, sessions, retries, tool prefixing, allowlists, redaction |
 | `reseau/front.py` | Graph8-facing side: legacy SSE server and token auth |
+| `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |
