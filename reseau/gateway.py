@@ -9,7 +9,9 @@ recorded in health() and raises UpstreamError on use; the others keep working.
 
 Reliability: every request goes through _Reliable, which applies reseau/outbound.py's policy (per-host
 concurrency cap, backoff on 429/5xx honouring Retry-After) to the SDK's async transport. Retried: idempotent
-HTTP methods, the MCP handshake/listing methods, and the upstream's bootstrap tool; never other tools/call.
+HTTP methods, the MCP handshake/listing methods, and the upstream's bootstrap tool. Other tools/call are
+retried on 429 only, and only on a read_only upstream: a 429 is refused before the tool runs, so repeating it
+can't double-apply. Never on 5xx, which may come after the tool ran.
 
 Secrets: tokens go into request headers only. Every error message built here names the env var,
 never its value. Tool results and upstream errors are scrubbed of every known token before they are
@@ -72,6 +74,9 @@ class Upstream:
     # A call carrying owner/repo arguments must be inside RESEAU_GITHUB_SCOPE, whoever makes it: a client,
     # get_evidence or the semantic tools. Checked before the upstream is called.
     repo_scoped: bool = False
+    # Every tool this upstream serves is read-only (e.g. a /readonly endpoint), so a tools/call refused with 429
+    # may be retried.
+    read_only: bool = False
 
 
 # Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
@@ -84,10 +89,10 @@ DEFAULT_UPSTREAMS = (
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
                               "list_issues", "issue_read"}),
              internal=frozenset({"search_pull_requests", "search_repositories", "list_branches"}),
-             repo_scoped=True),
+             repo_scoped=True, read_only=True),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
-                              "get_project"})),
+                              "get_project"}), read_only=True),
     # ponytail: Graph8 has no known read-only endpoint; the allowlist alone keeps its 126 tools out.
     Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE,
              prefix="",  # Graph8 already names its tools g8_*
@@ -274,28 +279,32 @@ class _Reliable(httpx2.AsyncBaseTransport):
     """outbound.Client's policy for the SDK's async httpx transport. outbound.Client itself is sync and
     buffers bodies, which the SDK's streaming (SSE) exchange can't use; the rules are shared, not copied."""
 
-    def __init__(self, slots, retry_tools=frozenset(), inner=None):
-        self.slots, self.retry_tools = slots, retry_tools
+    def __init__(self, slots, retry_tools=frozenset(), read_only=False, inner=None):
+        self.slots, self.retry_tools, self.read_only = slots, retry_tools, read_only
         self.inner = inner or httpx2.AsyncHTTPTransport()
 
-    def _retryable(self, request):
+    def _retry_statuses(self, request):
+        """The HTTP statuses this request may be retried on."""
         if request.method in outbound.IDEMPOTENT_METHODS:
-            return True
+            return outbound.RETRY_STATUSES
         try:
             msg = json.loads(request.content)
         except ValueError:
-            return False
+            return ()
         if not isinstance(msg, dict):
-            return False
+            return ()
         if msg.get("method") == "tools/call":
-            return (msg.get("params") or {}).get("name") in self.retry_tools
-        return msg.get("method") in outbound.SAFE_MCP_METHODS
+            if (msg.get("params") or {}).get("name") in self.retry_tools:
+                return outbound.RETRY_STATUSES
+            return (429,) if self.read_only else ()
+        return outbound.RETRY_STATUSES if msg.get("method") in outbound.SAFE_MCP_METHODS else ()
 
     async def handle_async_request(self, request):
         # The standalone GET SSE stream stays open for the whole session; capping it would pin a slot forever.
+        key = outbound.host_key(str(request.url))
         slot = None if request.method == "GET" else self.slots.setdefault(
-            outbound.host_key(str(request.url)), anyio.Semaphore(outbound.MAX_PER_HOST))
-        retry = self._retryable(request)
+            key, anyio.Semaphore(outbound.max_per_host(key)))
+        retry_on = self._retry_statuses(request)
         attempt = 0
         while True:
             attempt += 1
@@ -311,7 +320,7 @@ class _Reliable(httpx2.AsyncBaseTransport):
                 # ponytail: a response the caller never closes leaks its slot; the SDK always closes them.
                 resp.stream = _SlotStream(resp.stream, slot.release)
             wait = None
-            if retry and resp.status_code in outbound.RETRY_STATUSES:
+            if resp.status_code in retry_on:
                 wait = RETRY_POLICY.delay(attempt, outbound.parse_retry_after(resp.headers.get("retry-after")))
             if wait is None:
                 return resp
@@ -372,7 +381,7 @@ class Gateway:
                     headers=build_headers(token),
                     timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=300.0),
                     event_hooks={"response": [c.on_response]},
-                    transport=_Reliable(self.slots, {c.upstream.bootstrap_tool} - {None}),
+                    transport=_Reliable(self.slots, {c.upstream.bootstrap_tool} - {None}, c.upstream.read_only),
                 ))
                 c.client = await stack.enter_async_context(
                     Client(streamable_http_client(c.upstream.url, http_client=http), mode="legacy"))

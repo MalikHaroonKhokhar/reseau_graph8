@@ -1,11 +1,13 @@
 import asyncio
 import io
+import json
 import logging
 import socket
 import subprocess
 import sys
 
 import anyio
+import httpx2
 import pytest
 
 from mcp.shared.exceptions import MCPError
@@ -410,7 +412,7 @@ def test_429_html_on_connect_and_bootstrap_is_retried():
     assert health["graph8"] == {"ok": True, "error": None}
 
 
-def test_429_on_tool_call_is_not_retried_and_is_structured(caplog):
+def test_429_on_tool_call_is_not_retried_off_a_read_only_upstream_and_is_structured(caplog):
     caplog.set_level(logging.DEBUG)
 
     async def go():
@@ -432,16 +434,70 @@ def test_429_on_tool_call_is_not_retried_and_is_structured(caplog):
     assert G8_TOKEN not in caplog.text
 
 
-def test_per_host_concurrency_cap():
+@pytest.mark.parametrize("caps, peak", [({}, outbound.MAX_PER_HOST), ({"127.0.0.1": 3}, 3)])
+def test_per_host_concurrency_cap(monkeypatch, caps, peak):
+    monkeypatch.setattr(outbound, "HOST_CAPS", caps)  # the mock's host: unknown by default, then capped at 3
+
     async def go():
         with MockUpstream(G8_TOKEN, stateless=True) as g8:
             async with Gateway(graph8(g8, bootstrap=False), G8_ENV) as gw:
                 async with anyio.create_task_group() as tg:
-                    for i in range(5):
+                    for i in range(6):
                         tg.start_soon(gw.call_tool, "graph8", "slow", {"text": str(i)})
                 return g8.peak
 
-    assert run(go()) == outbound.MAX_PER_HOST
+    assert run(go()) == peak
+
+
+class Replies(httpx2.AsyncBaseTransport):
+    """An inner transport answering with the given (status, headers), one per request."""
+
+    def __init__(self, *replies):
+        self.replies, self.sent = list(replies), 0
+
+    async def handle_async_request(self, request):
+        self.sent += 1
+        status, headers = self.replies.pop(0)
+        return httpx2.Response(status, headers=headers, content=b"{}")
+
+
+@pytest.mark.parametrize("read_only, replies, status, sent, waits", [
+    (True, [(429, {"retry-after": "2"}), (200, {})], 200, 2, [2.0]),  # refused before it ran: wait, repeat
+    (True, [(503, {}), (200, {})], 503, 1, []),  # may have run: never repeated
+    (False, [(429, {"retry-after": "2"}), (200, {})], 429, 1, []),  # an upstream with write tools: never repeated
+])
+def test_tools_call_is_retried_on_429_only_and_only_on_a_read_only_upstream(monkeypatch, read_only, replies,
+                                                                            status, sent, waits):
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(gateway.anyio, "sleep", sleep)
+    inner = Replies(*replies)
+    request = httpx2.Request("POST", "https://api.githubcopilot.com/mcp/readonly", content=json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_issues"}}).encode())
+
+    async def go():
+        resp = await gateway._Reliable({}, read_only=read_only, inner=inner).handle_async_request(request)
+        await resp.aclose()
+        return resp.status_code
+
+    assert (run(go()), inner.sent, slept) == (status, sent, waits)
+
+
+def test_429_on_tool_call_is_retried_on_a_read_only_upstream():
+    async def go():
+        with MockUpstream(GH_TOKEN, stateless=False) as gh:
+            up = Upstream("github", gh.url, "GITHUB_MCP_TOKEN", read_only=True)
+            async with Gateway([up], {"GITHUB_MCP_TOKEN": GH_TOKEN}) as gw:
+                gh.fail_status, gh.fail_times = 429, 1  # Cloudflare-style HTML 429, no Retry-After
+                res = await gw.call_tool("github", "echo", {"text": "a"})
+                return res.content[0].text, gh.fail_status, gw.health()
+
+    text, fail_status, health = run(go())
+    assert (text, fail_status) == ("echo:a", None)  # the 429 was spent, then the retry answered
+    assert health["github"]["ok"]
 
 
 # ---- tool-name namespacing (HAR-94) ----
@@ -564,4 +620,6 @@ def test_default_config_is_read_only_and_allowlisted():
     assert all(u.allow is not None for u in DEFAULT_UPSTREAMS)
     assert not ups["github"].allow & {"search_pull_requests", "search_repositories", "list_branches"}
     assert ups["github"].repo_scoped and not ups["linear"].repo_scoped
+    # 429 retry for tools/call: the /readonly endpoints only; Graph8's endpoint also serves write tools
+    assert ups["github"].read_only and ups["linear"].read_only and not ups["graph8"].read_only
     assert ups["graph8"].bootstrap_tool in ups["graph8"].allow

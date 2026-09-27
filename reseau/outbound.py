@@ -3,11 +3,13 @@
 Why (spikes/mcp_bridge/FINDINGS.md, "Cloudflare throttling and UA banning"): be.graph8.com answers bursts with
 HTTP 429 plus an HTML "Just a moment..." page, and bans library-default user-agents (403, error 1010). So every
 request gets an explicit User-Agent, a content-type check before parsing, backoff on 429/5xx, connect and read
-timeouts, and a per-host concurrency cap. Whether GitHub/Linear behave the same is unverified; all hosts get it.
+timeouts, and a per-host concurrency cap. GitHub and Linear were measured in HAR-99 (test_connection/FINDINGS.md
+Run 5): neither challenges with HTML, and their caps (HOST_CAPS) are set from those numbers.
 
 RETRY SCOPE: only idempotent reads (GET/HEAD/OPTIONS) and the MCP handshake (SAFE_MCP_METHODS) are retried by
 default. tools/call and any other call with side effects is NOT retried here; business-level retry is out of scope.
-Pass retry=True only when you know the call is safe to repeat.
+Pass retry=True only when you know the call is safe to repeat. (The gateway's async transport also retries
+tools/call on 429 for read-only upstreams; see gateway._Reliable.)
 """
 import http.client
 import json
@@ -22,7 +24,6 @@ from email.utils import parsedate_to_datetime
 
 log = logging.getLogger("reseau.http")
 
-# ponytail: starting constants, tune after the concurrency spike.
 USER_AGENT = "reseau-gateway/0.1"
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 0.5       # seconds; full jitter over base * 2**(attempt-1)
@@ -30,7 +31,11 @@ BACKOFF_CAP = 8.0
 RETRY_AFTER_CAP = 30.0   # server asks for longer than this -> give up instead of stalling the agent turn
 CONNECT_TIMEOUT = 10.0
 READ_TIMEOUT = 60.0
-MAX_PER_HOST = 2
+MAX_PER_HOST = 2  # hosts not in HOST_CAPS
+# Concurrent requests per host, measured in HAR-99 (test_connection/FINDINGS.md Run 5). GitHub drew 429s at ~17
+# req/s; 8 x ~0.85 s is ~9 req/s. Linear limits a request budget, not concurrency, so 4 only cuts queueing.
+# Graph8's edge challenges ~6 parallel calls.
+HOST_CAPS = {"api.githubcopilot.com": 8, "mcp.linear.app": 4, "be.graph8.com": 2}
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 IDEMPOTENT_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -116,6 +121,11 @@ def host_key(url):
     return (u.hostname or "").rstrip("."), u.port or (443 if u.scheme.lower() == "https" else 80)
 
 
+def max_per_host(key):
+    """Concurrency cap for a host_key: HOST_CAPS, else MAX_PER_HOST."""
+    return HOST_CAPS.get(key[0], MAX_PER_HOST)
+
+
 def parse_retry_after(value, clock=time.time):
     """Retry-After header (delta-seconds or HTTP-date) -> seconds to wait, or None if absent/unparseable."""
     if not value:
@@ -146,7 +156,7 @@ def _parse_sse(text):
 
 class Client:
     def __init__(self, transport=http_transport, policy=None, sleep=time.sleep, clock=time.time,
-                 max_per_host=MAX_PER_HOST, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+                 max_per_host=None, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
         self.transport, self.policy = transport, policy or RetryPolicy()
         self.sleep, self.clock, self.max_per_host = sleep, clock, max_per_host
         self.connect_timeout, self.read_timeout = connect_timeout, read_timeout
@@ -154,7 +164,7 @@ class Client:
 
     def _slot(self, host):
         with self._lock:
-            return self._slots.setdefault(host, threading.BoundedSemaphore(self.max_per_host))
+            return self._slots.setdefault(host, threading.BoundedSemaphore(self.max_per_host or max_per_host(host)))
 
     def _retry_after(self, value):
         return parse_retry_after(value, self.clock)
