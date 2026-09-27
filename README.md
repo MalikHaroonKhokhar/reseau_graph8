@@ -159,8 +159,8 @@ can't run it.
    `uv run python -m reseau.tunnel --url https://<service>.onrender.com`
 4. A free service sleeps after 15 minutes without requests and takes about a minute to wake, which Graph8's
    first call won't wait for. Keep it awake with a free pinger (cron-job.org, UptimeRobot) on
-   `https://<service>.onrender.com/ping` every 10 minutes. It answers 404, which still counts; never put the
-   token in the pinger's URL.
+   `https://<service>.onrender.com/ping` every 10 minutes. It answers `ok` (so does `/`; every other path
+   without the token is a 404); never put the token in the pinger's URL.
 
 Once deployed, run the dashboard alone (`uv run python -m reseau.dashboard`), not `./run.sh`: its tunnel
 would move the registration back to localhost.run.

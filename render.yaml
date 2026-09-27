@@ -5,6 +5,7 @@ services:
     name: reseau-gateway
     runtime: docker
     plan: free
+    healthCheckPath: /ping
     envVars:
       - key: GITHUB_MCP_TOKEN
         sync: false
