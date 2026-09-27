@@ -47,7 +47,7 @@ UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
 OUT_OF_SCOPE = -32012  # after reseau/evidence's and reseau/semantic's codes
 # -32008, -32009, -32010: reseau/evidence (not found, upstream error, search incomplete)
-# -32011: reseau/semantic (unmapped person)
+# -32011, -32013, -32014: reseau/semantic (unmapped person, unknown project, team not configured)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -83,7 +83,8 @@ class Upstream:
 # plus a minimal allowlist for the semantic tools (HAR-100, HAR-101, HAR-109); grow it from those tickets.
 # GitHub reads are limited to RESEAU_GITHUB_SCOPE. Every allowlisted tool but get_me takes owner/repo, so the
 # repo_scoped check covers them all; keep it that way. Search takes a free-text query instead, so it is
-# internal: the semantic tools add the scope's qualifiers to every query, and no client can call it.
+# internal: the semantic tools add the scope's qualifiers to every query, and no client can call it. Linear's
+# list_users is internal too: the team roster needs it, but it returns every workspace member's email.
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
@@ -92,7 +93,8 @@ DEFAULT_UPSTREAMS = (
              repo_scoped=True, read_only=True),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
-                              "get_project"}), read_only=True),
+                              "get_project"}),
+             internal=frozenset({"list_users"}), read_only=True),
     # ponytail: Graph8 has no known read-only endpoint; the allowlist alone keeps its 126 tools out.
     Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE,
              prefix="",  # Graph8 already names its tools g8_*
@@ -343,6 +345,8 @@ class Gateway:
         self.identities = evidence.load_identities(env) if identities is None else evidence.identity_index(identities)
         self.tz = semantic.load_tz(env)
         self.github_scope = semantic.load_scope(env)
+        self.projects = semantic.load_projects(env, self.github_scope)
+        self.team = env.get(semantic.TEAM_ENV) or None
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}

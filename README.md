@@ -32,6 +32,12 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   structured facts, not prose, and every fact carries the activity_ids `get_evidence` resolves. Commits come
   from every branch, unmerged feature branches included. Every listing is paged through; anything cut off by
   a safety limit is named in the answer's `incomplete`, never dropped silently.
+- **Project and team facts with their evidence.** `get_project_context(project)` returns a configured
+  project's open, in-progress and blocked Linear issues, the open PRs in its repositories, and the issues
+  completed and PRs merged in the last 7 days. `get_team_summary(date)` counts one day's completed issues,
+  merged PRs and commits per team member and in total, and lists the team's blocked issues. Every count comes
+  with its activity_ids and always equals their number. An issue is blocked when a Linear blocked-by relation
+  points at an open issue; the answer names the blocker and the open PRs it waits on.
 - **GitHub scope is a permission.** `RESEAU_GITHUB_SCOPE` is the complete list of GitHub owners and repos
   the gateway may read: the raw `github_*` tools, `get_evidence` and the semantic tools alike. A call for
   any other repo is refused before it reaches GitHub (`-32012 out_of_scope`), and an org's repos are never
@@ -54,7 +60,9 @@ cp .env.example .env   # then fill it in
 | `GRAPH8_API_KEY` | Graph8 org API key (`g8_live_…`). Used as an upstream and by the registration script. |
 | `RESEAU_IDENTITIES` | Optional. Path to a JSON map of people to their upstream IDs, e.g. `{"ana": {"github": "ana-gh", "linear": "<Linear user id>"}}`. Actors not in the map are reported as `unmapped`, never guessed. `get_person_activity` only accepts people in this map. |
 | `RESEAU_GITHUB_SCOPE` | Comma-separated GitHub owners (users or orgs) and `owner/repo` entries: everything the gateway may read on GitHub, e.g. `ana-gh,acme/app`. An owner entry covers only repos that account owns, not the orgs it belongs to. Unset means no GitHub repo is read. |
-| `RESEAU_TIMEZONE` | Optional. IANA timezone (e.g. `Asia/Karachi`) that sets where a day starts for `get_person_activity`'s date and for "yesterday". Default `UTC`. |
+| `RESEAU_PROJECTS` | Optional. Path to a JSON map of projects to their Linear project and GitHub repos, e.g. `{"app": {"linear": "App launch", "repos": ["acme/app"]}}`. Every repo must be inside `RESEAU_GITHUB_SCOPE`. `get_project_context` only accepts projects in this map. |
+| `RESEAU_TEAM` | Optional. The Linear team (name, key or ID) that `get_team_summary` covers. Members not in `RESEAU_IDENTITIES` are listed as unmapped and not counted. |
+| `RESEAU_TIMEZONE` | Optional. IANA timezone (e.g. `Asia/Karachi`) that sets where a day starts for `get_person_activity`'s and `get_team_summary`'s date and for "yesterday". Default `UTC`. |
 | `RESEAU_GATEWAY_TOKEN` | Secret Graph8 uses to reach the gateway. Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Comma-separate several to rotate. |
 
 ## Run
@@ -111,7 +119,7 @@ The tests run against local mock MCP servers on loopback and need no network.
 | `reseau/gateway.py` | Upstream side: credentials, sessions, retries, tool prefixing, allowlists, redaction |
 | `reseau/front.py` | Graph8-facing side: legacy SSE server and token auth |
 | `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source |
-| `reseau/semantic.py` | `get_person_activity` and `get_my_day_context`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links and unresolved threads are resolved. |
+| `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context` and `get_team_summary`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues and team membership are resolved. |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |

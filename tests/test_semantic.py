@@ -1,8 +1,10 @@
-"""HAR-100: get_person_activity and get_my_day_context. Pure aggregation, both tools over a scripted world of
-upstream answers (built from the recorded fixtures), and both tools over MCP through the gateway."""
+"""HAR-100: get_person_activity and get_my_day_context; HAR-101: get_project_context and get_team_summary. Pure
+aggregation, the tools over a scripted world of upstream answers (built from the recorded fixtures), and the tools
+over MCP through the gateway."""
 import copy
 import dataclasses
 import json
+import random
 import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -26,6 +28,9 @@ TODAY, YESTERDAY = "2026-09-27", "2026-09-26"
 LOGIN, LINEAR_ID = PEOPLE["dev"]["github"], PEOPLE["dev"]["linear"]
 RG, UI = "octo-dev/reseau_graph8", "private-org/ui-critic"  # UI is an org repo: read only once "private-org" is in scope
 SCOPE = (LOGIN, "private-org")
+TEAM, ANA = "Engineering", "00000000-0000-4000-8000-000000000002"
+TEAM_PEOPLE = PEOPLE | {"ana": {"github": "ana-gh", "linear": ANA}}
+PROJECTS = {"reseau": {"linear": "Réseau", "repos": [RG, UI]}}
 
 
 # ---- the scripted world: what GitHub and Linear answer, in their recorded shapes ----
@@ -169,9 +174,9 @@ def world(empty=False):
 class FakeGateway:
     """What the semantic handlers use of Gateway, answering from a scripted world."""
 
-    def __init__(self, w, tz="UTC", people=PEOPLE, scope=SCOPE):
+    def __init__(self, w, tz="UTC", people=PEOPLE, scope=SCOPE, projects=PROJECTS, team=TEAM):
         self.world, self.tz, self.identities, self.calls = w, ZoneInfo(tz), evidence.identity_index(people), []
-        self.github_scope = scope
+        self.github_scope, self.projects, self.team = scope, projects, team
 
     async def call_tool(self, source, tool, args):
         self.calls.append((source, tool, args))
@@ -427,3 +432,239 @@ def test_green_both_tools_over_mcp_return_schema_valid_output():
     assert (day["yesterday"]["commit_count"], day["yesterday"]["repo_count"]) == (6, 2)
     assert day["focus"][0]["blocking_prs"][0]["activity_id"] == "github:pr:%s#9" % UI
     assert len(day["needs_attention"][0]["unresolved"]) == 2
+
+
+# ---- HAR-101: get_project_context and get_team_summary ----
+
+ENG_142, PR_9 = "linear:issue:ENG-142", "github:pr:%s#9" % RG
+
+
+def done(ident, completed, assignee):
+    """A completed issue as list_issues returns it with COMPLETED_FIELDS."""
+    return {"id": ident, "title": "Ship " + ident, "url": "https://linear.app/acme/issue/" + ident, "status": "Done",
+            "createdBy": "Dev Person", "createdById": LINEAR_ID, "createdAt": "2026-09-01T00:00:00.000Z",
+            "updatedAt": completed, "completedAt": completed, "assigneeId": assignee}
+
+
+def merged_item(repo, number, merged_at, login):
+    item = search_item(repo, number)
+    return item | {"user": item["user"] | {"login": login}, "pull_request": {"merged_at": merged_at}}
+
+
+def team_world():
+    """world() plus a team and a project. Yesterday dev completed ENG-142 and merged PR #9; everything else is
+    what the tools must leave out: another day, an unmapped member, no assignee, someone outside the team."""
+    w = world()
+    gh, lin = w["github"], w["linear"]
+    completed = [done("ENG-142", "2026-09-26T15:00:00.000Z", LINEAR_ID),
+                 done("ENG-141", "2026-09-26T16:00:00.000Z", "u-sam"),  # an unmapped member's
+                 done("ENG-140", "2026-09-26T17:00:00.000Z", None),  # nobody's
+                 done("ENG-139", "2026-09-25T12:00:00.000Z", LINEAR_ID),  # the day before: still recent
+                 done("ENG-100", "2026-09-10T12:00:00.000Z", LINEAR_ID)]  # not even recent
+    opened = {"started": [listed("HAR-8", "Docs pass", 3, "Medium", "started", "2026-09-26T12:00:00Z"),
+                          listed("HAR-7", "UI Critic Phase 3", 1, "Urgent", "started", "2026-09-26T10:00:00Z")],
+              "unstarted": [listed("HAR-9", "Phase 4 spec", 2, "High", "unstarted", "2026-09-26T11:00:00Z")],
+              "backlog": []}
+    merged = [merged_item(RG, 9, "2026-09-26T14:00:00Z", LOGIN),
+              merged_item("octo-dev/sandbox", 30, "2026-09-26T14:30:00Z", "stranger")]
+    stranger = commit(UI, 12, "2026-09-26T12:00:00Z") | {"author": {"login": "stranger"}}
+    extra = {"HAR-8": issue("HAR-8", "Docs pass", "started", prs=[(RG, 20)]),  # waits on its own open PR, blocked by nothing
+             "HAR-9": issue("HAR-9", "Phase 4 spec", "unstarted")}
+    list_issues, get_issue, list_commits = lin["list_issues"], lin["get_issue"], gh["list_commits"]
+    search_prs, pull_request_read = gh["search_pull_requests"], gh["pull_request_read"]
+
+    def issues(a):
+        if "team" in a or "project" in a:
+            return linear_page(completed if a["state"] == "completed" else opened[a["state"]], a)
+        return list_issues(a)
+
+    def list_users(a):
+        if a["team"] != TEAM:
+            raise RuntimeError("Team not found")  # Linear's live answer
+        return {"users": [{"id": LINEAR_ID, "name": "Dev Person"}, {"id": ANA, "name": "Ana"},
+                          {"id": "u-sam", "name": "Sam"}], "hasNextPage": False}
+
+    def search(a):
+        q = a["query"]
+        found = merged if q.startswith("merged:") else [search_item(RG, 20), search_item(UI, 9)] \
+            if q.startswith("is:open") else None
+        return search_prs(a) if found is None else search_page(
+            [p for p in found if scoped(q, [github.repo(p["html_url"])])], a)
+
+    def read(a):
+        if (a["method"], a["repo"], a["pullNumber"]) == ("get", "reseau_graph8", 20):
+            return pr(RG, 20, "open")
+        return pull_request_read(a)
+
+    lin |= {"list_issues": issues, "list_users": list_users, "get_issue": lambda a: extra.get(a["id"]) or get_issue(a)}
+    gh |= {"search_pull_requests": search, "pull_request_read": read, "list_commits": lambda a: list_commits(a) + (
+        [stranger] if (a["repo"], a["sha"], a.get("page", 1)) == ("ui-critic", "main", 1) else [])}
+    return w
+
+
+def team_summary(day=YESTERDAY, w=None, **kw):
+    return run(semantic.team_summary(FakeGateway(w or team_world(), **{"people": TEAM_PEOPLE} | kw), {"date": day}))
+
+
+def project_context(project="reseau", w=None, **kw):
+    return run(semantic.project_context(FakeGateway(w or team_world(), **{"people": TEAM_PEOPLE} | kw),
+                                        {"project": project}))
+
+
+def counts(value):
+    """Every {count, activity_ids} anywhere in an answer."""
+    if isinstance(value, dict):
+        return ([value] if "count" in value else []) + [c for v in value.values() for c in counts(v)]
+    return [c for v in value for c in counts(v)] if isinstance(value, list) else []
+
+
+def test_red_team_day_counts_one_completed_issue_and_one_merged_pr():
+    total = team_summary().total
+    assert total.completed == semantic.Count(1, [ENG_142])
+    assert total.merged == semantic.Count(1, [PR_9])
+
+
+def test_team_summary_per_person():
+    s = team_summary()
+    assert (s.team, s.date, s.timezone, s.github_scope, s.incomplete) == (TEAM, YESTERDAY, "UTC", [LOGIN, "private-org"], [])
+    assert s.total.commits.count == 6  # yesterday's six; the stranger's commit is not the team's
+    assert s.people == {"ana": semantic.Tally(*[semantic.Count(0, [])] * 3), "dev": s.total}
+    assert s.unmapped == [Actor("linear", "u-sam", "Sam")]  # listed, and ENG-141 is not counted
+
+
+def test_counts_always_equal_their_evidence():
+    empty = world(empty=True)
+    empty["linear"]["list_users"] = lambda a: {"users": [], "hasNextPage": False}
+    answers = [team_summary(), team_summary(tz="Asia/Karachi"), team_summary(TODAY), team_summary(w=empty)]
+    for s in answers:
+        found = counts(dataclasses.asdict(s))
+        assert len(found) == 3 * (1 + len(s.people))
+        for c in found:
+            assert c["count"] == len(c["activity_ids"]) == len(set(c["activity_ids"]))
+    # and for any mix of activity: duplicates, people outside the team, nobody
+    rng = random.Random(101)
+    for _ in range(200):
+        credited = [(rng.choice(["dev", "ana", "sam", None]),
+                     semantic.Activity("github:commit:o/r@%07x" % rng.randrange(20) if action == "commit" else
+                                       "linear:issue:ENG-%d" % rng.randrange(20) if action == "issue_completed" else
+                                       "github:pr:o/r#%d" % rng.randrange(20),
+                                       action, "2026-09-26T%02d:00:00Z" % rng.randrange(24), None))
+                    for action in rng.choices(["commit", "issue_completed", "pr_merged"], k=rng.randrange(30))]
+        total, people = semantic.team_tally(credited, ["ana", "dev"])
+        for c in counts(dataclasses.asdict(total)) + counts([dataclasses.asdict(t) for t in people.values()]):
+            assert c["count"] == len(c["activity_ids"]) == len(set(c["activity_ids"]))
+        for field in ("completed", "merged", "commits"):  # the total is exactly the members' activity
+            assert set(getattr(total, field).activity_ids) == {
+                i for t in people.values() for i in getattr(t, field).activity_ids}
+
+
+def test_blocked_from_linear_relations():
+    s = team_summary()
+    [b] = s.blocked  # HAR-8 and HAR-9 have no blocker
+    assert (b.activity_id, b.blocked_by) == ("linear:issue:HAR-7", ["linear:issue:HAR-6"])  # HAR-5 is done
+    assert [(p.activity_id, p.via) for p in b.blocking_prs] == [("github:pr:%s#9" % UI, "linear:issue:HAR-6")]
+
+
+def test_team_reads_everyone_once_and_no_pr_of_an_unblocked_issue():
+    gw = FakeGateway(team_world(), people=TEAM_PEOPLE)
+    run(semantic.team_summary(gw, {"date": YESTERDAY}))
+    assert all("author" not in args for _, tool, args in gw.calls if tool == "list_commits")
+    assert (RG, 20) not in {("%s/%s" % (a["owner"], a["repo"]), a["pullNumber"])
+                            for _, tool, a in gw.calls if tool == "pull_request_read"}  # HAR-8's own PR
+
+
+def test_team_errors_are_structured():
+    with pytest.raises(MCPError) as e:
+        team_summary(team=None)
+    assert (e.value.code, e.value.data["kind"]) == (-32014, "team_not_configured")
+    with pytest.raises(MCPError) as e:
+        team_summary("26/09/2026")
+    assert (e.value.code, e.value.data["kind"]) == (-32602, "invalid_params")
+    with pytest.raises(MCPError) as e:
+        team_summary(team="Nope")
+    assert (e.value.code, e.value.data["kind"]) == (-32009, "upstream_error")
+    assert "Team not found" in e.value.message
+
+
+def test_project_context():
+    c = project_context()
+    assert (c.project, c.linear_project, c.repos, c.since, c.incomplete) == (
+        "reseau", "Réseau", [RG, UI], "2026-09-20T09:00:00Z", [])
+    assert [i.activity_id for i in c.open] == ["linear:issue:HAR-9"]
+    assert [i.activity_id for i in c.in_progress] == ["linear:issue:HAR-7", "linear:issue:HAR-8"]  # Urgent first
+    [b] = c.blocked
+    assert (b.activity_id, b.blocked_by) == ("linear:issue:HAR-7", ["linear:issue:HAR-6"])
+    assert [(p.activity_id, p.via) for p in b.blocking_prs] == [("github:pr:%s#9" % UI, "linear:issue:HAR-6")]
+    assert [(p.activity_id, p.via) for p in c.in_progress[1].blocking_prs] == [
+        ("github:pr:%s#20" % RG, "linear:issue:HAR-8")]
+    assert [(a.action, a.activity_id) for a in c.open_prs] == [
+        ("pr_opened", "github:pr:%s#20" % RG), ("pr_opened", "github:pr:%s#9" % UI)]
+    # the last 7 days, oldest first: not ENG-100, and not sandbox#30, which is outside the project's repos
+    assert [(a.action, a.activity_id) for a in c.recent] == [
+        ("issue_completed", "linear:issue:ENG-139"), ("pr_merged", PR_9), ("issue_completed", ENG_142),
+        ("issue_completed", "linear:issue:ENG-141"), ("issue_completed", "linear:issue:ENG-140")]
+
+
+def test_every_project_item_carries_an_activity_id():
+    c = dataclasses.asdict(project_context())
+    items = [i for key in ("open", "in_progress", "blocked", "open_prs", "recent") for i in c[key]]
+    assert items and all(evidence.parse(i["activity_id"]) and i["record"]["activity_id"] == i["activity_id"]
+                         for i in items)
+
+
+def test_red_unknown_project_is_a_structured_error():
+    gw = FakeGateway(team_world())
+    with pytest.raises(MCPError) as e:
+        run(semantic.project_context(gw, {"project": "nope"}))
+    assert (e.value.code, e.value.data) == (-32013, {"kind": "unknown_project", "project": "nope", "known": ["reseau"]})
+    assert gw.calls == []
+
+
+def test_project_without_repos_never_searches_github():
+    gw = FakeGateway(team_world(), projects={"docs": {"linear": "Réseau", "repos": []}})
+    c = run(semantic.project_context(gw, {"project": "docs"}))
+    assert (c.open_prs, [a.action for a in c.recent].count("pr_merged")) == ([], 0)
+    assert not [tool for _, tool, _ in gw.calls if tool.startswith("search_")]  # never the whole scope
+
+
+def test_projects_config(tmp_path):
+    path = tmp_path / "projects.json"
+
+    def load(projects, scope=SCOPE):
+        path.write_text(json.dumps(projects))
+        return semantic.load_projects({"RESEAU_PROJECTS": str(path)}, scope)
+
+    assert semantic.load_projects({}) == {}
+    assert load(PROJECTS) == PROJECTS
+    for bad in ({"x": {"linear": "X", "repos": ["private-org"]}}, {"x": {"repos": [RG]}}, {"x": [RG]},
+                {"x": {"linear": "X", "repos": RG}}):
+        with pytest.raises(ValueError, match="RESEAU_PROJECTS"):
+            load(bad)
+    with pytest.raises(ValueError, match="inside RESEAU_GITHUB_SCOPE"):  # a project can't widen the scope
+        load(PROJECTS, scope=(LOGIN,))
+
+
+def test_green_project_and_team_over_mcp_return_schema_valid_output(tmp_path):
+    projects = tmp_path / "projects.json"
+    projects.write_text(json.dumps(PROJECTS))
+    w = team_world()
+    with MockUpstream(GH_TOKEN, stateless=False, script=w["github"]) as gh, \
+            MockUpstream(LIN_TOKEN, stateless=True, script=w["linear"]) as lin:
+        async def body(base, gw):
+            async with Client(sse_client(base + "/g8/%s/sse" % TOK), mode="legacy") as c:
+                tools = {t.name: t for t in (await c.list_tools()).tools}
+                return tools, (await c.call_tool("get_project_context", {"project": "reseau"}),
+                               await c.call_tool("get_team_summary", {"date": YESTERDAY}))
+
+        tools, results = run(serving((gh, lin), body, identities=TEAM_PEOPLE, env={
+            "RESEAU_GITHUB_SCOPE": "%s,private-org" % LOGIN, "RESEAU_PROJECTS": str(projects), "RESEAU_TEAM": TEAM}))
+
+    for name, res in zip(("get_project_context", "get_team_summary"), results):
+        assert not res.is_error
+        jsonschema.validate(res.structured_content, tools[name].output_schema)
+    project, team = (r.structured_content for r in results)
+    assert [i["activity_id"] for i in project["blocked"]] == ["linear:issue:HAR-7"]
+    assert len(project["recent"]) == 5 and project["incomplete"] == []
+    assert team["total"]["completed"] == {"count": 1, "activity_ids": [ENG_142]}
+    assert team["total"]["merged"] == {"count": 1, "activity_ids": [PR_9]}
+    assert team["blocked"][0]["blocking_prs"][0]["activity_id"] == "github:pr:%s#9" % UI
