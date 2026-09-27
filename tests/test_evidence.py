@@ -79,7 +79,7 @@ def test_activity_id_round_trip(aid):
     assert evidence.format_id(*evidence.parse(aid)) == aid
 
 
-@pytest.mark.parametrize("aid", [None, "", "github:pr:o/r", "github:pr:o/r#9x", "gitlab:pr:o/r#1", "github:issue:o/r#1",
+@pytest.mark.parametrize("aid", [None, 42, ["github:pr:o/r#9"], {"id": 1}, "", "github:pr:o/r", "github:pr:o/r#9x", "gitlab:pr:o/r#1", "github:issue:o/r#1",
                                  "github:commit:" + SHA, "linear:issue:eng-1", "linear:issue:ENG-1 "])
 def test_invalid_activity_id_is_structured(aid):
     with pytest.raises(MCPError) as e:
@@ -144,6 +144,15 @@ def test_review_comment_missing_after_last_page_is_not_found():
     with pytest.raises(MCPError) as e:
         run(evidence.get_evidence(call, COMMENT_ID.replace("4102813786", "7"), {}))
     assert (e.value.code, e.value.data["kind"], len(calls)) == (-32008, "not_found", 2)
+
+
+def test_page_limit_with_pages_left_is_incomplete_not_not_found(monkeypatch):
+    monkeypatch.setattr(evidence, "MAX_PAGES", 2)
+    page = json.dumps(fixture("github_review_comments"))  # hasNextPage: true, target not on it
+    call, calls = fake((page, False), (page, False))
+    with pytest.raises(MCPError) as e:
+        run(evidence.get_evidence(call, COMMENT_ID.replace("4102813786", "7"), {}))
+    assert (e.value.code, e.value.data["kind"], len(calls)) == (-32010, "search_incomplete", 2)
 
 
 def test_other_upstream_error_is_not_reported_as_not_found():

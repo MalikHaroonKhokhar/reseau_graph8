@@ -43,7 +43,7 @@ UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
-# -32008, -32009: reseau/evidence (not found, upstream error)
+# -32008, -32009, -32010: reseau/evidence (not found, upstream error, search incomplete)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003

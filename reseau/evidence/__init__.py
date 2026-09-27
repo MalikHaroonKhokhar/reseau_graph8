@@ -21,12 +21,13 @@ from reseau.evidence import github, linear
 
 SOURCES = {"github": github.KINDS, "linear": linear.KINDS}
 IDENTITIES_ENV = "RESEAU_IDENTITIES"
-MAX_PAGES = 10  # ponytail: review comments are found by paging; 10 x 100 threads, then reported not found
+MAX_PAGES = 10  # review comments are found by paging; past 10 x 100 threads the search reports search_incomplete
 
 # Continues gateway.py's JSON-RPC code list.
 INVALID_ACTIVITY_ID = -32602  # JSON-RPC "invalid params"
 EVIDENCE_NOT_FOUND = -32008
 EVIDENCE_UPSTREAM_ERROR = -32009
+EVIDENCE_SEARCH_INCOMPLETE = -32010
 # The phrases the live upstreams use for a missing object (captured in this ticket's probes).
 UPSTREAM_NOT_FOUND = re.compile(r"404 Not Found|No commit found|Could not resolve to a|Could not find referenced")
 
@@ -45,7 +46,7 @@ def _error(code, kind, message, activity_id):
 
 def parse(activity_id):
     """activity_id -> (source, kind, fields). Raises MCPError(invalid_activity_id)."""
-    source, _, rest = (activity_id or "").partition(":")
+    source, _, rest = (activity_id if isinstance(activity_id, str) else "").partition(":")
     kind_name, _, key = rest.partition(":")
     kind = SOURCES.get(source, {}).get(kind_name)
     m = kind and kind.regex.fullmatch(key)
@@ -107,6 +108,9 @@ async def get_evidence(call_tool, activity_id, index, now=None):
         args = kind.next_page and kind.next_page(payload, args)
         if not args:
             break
+    else:  # pages remain unsearched: the record may exist, so never call it not_found
+        raise _error(EVIDENCE_SEARCH_INCOMPLETE, "search_incomplete",
+                     "%s: searched %d pages without finding it; more remain" % (activity_id, MAX_PAGES), activity_id)
     raise _error(EVIDENCE_NOT_FOUND, "not_found", "no evidence found for %s" % activity_id, activity_id)
 
 
