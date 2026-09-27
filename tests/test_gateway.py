@@ -549,7 +549,7 @@ def test_merged_surface_routes_each_name_to_its_upstream(mocks):
             return names, out, e.value
 
     names, out, err = run(go())
-    assert len(names) == len(set(names)) == 17  # 7 per upstream + get_evidence and the 2 semantic tools
+    assert len(names) == len(set(names)) == 19  # 7 per upstream + get_evidence and the 4 semantic tools
     # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
     assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
                    "github_list_releases": "list_releases@mock-stateful",
@@ -603,7 +603,8 @@ def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
             return names, raw.value, exposed.value, internal_by_client.value, internal, ok, gw.health()
 
     names, raw, exposed, internal_by_client, internal, ok, health = run(go())
-    assert names == ["linear_list_issues", "get_evidence", "get_person_activity", "get_my_day_context"]
+    assert names == ["linear_list_issues", "get_evidence", "get_person_activity", "get_my_day_context",
+                     "get_project_context", "get_team_summary"]
     assert (raw.code, raw.data["kind"]) == (-32007, "tool_not_allowed")
     assert exposed.data["kind"] == "unknown_tool"
     # an internal tool is callable by Réseau's own tools only: not listed, not routed for a client
@@ -619,6 +620,7 @@ def test_default_config_is_read_only_and_allowlisted():
     assert ups["github"].url.endswith("/mcp/readonly") and ups["linear"].url.endswith("/mcp/readonly")
     assert all(u.allow is not None for u in DEFAULT_UPSTREAMS)
     assert not ups["github"].allow & {"search_pull_requests", "search_repositories", "list_branches"}
+    assert "list_users" in ups["linear"].internal and "list_users" not in ups["linear"].allow  # emails
     assert ups["github"].repo_scoped and not ups["linear"].repo_scoped
     # 429 retry for tools/call: the /readonly endpoints only; Graph8's endpoint also serves write tools
     assert ups["github"].read_only and ups["linear"].read_only and not ups["graph8"].read_only
