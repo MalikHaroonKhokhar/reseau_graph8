@@ -1,0 +1,508 @@
+{
+  "review_date": "2026-09-27",
+  "tests": "73 passed",
+  "checks": [
+    {
+      "check": "transport",
+      "result": {
+        "streamable_http": {
+          "status": 422,
+          "msg": [
+            "Input should be 'sse' or 'stdio'"
+          ]
+        },
+        "streamable-http": {
+          "status": 422,
+          "msg": [
+            "Input should be 'sse' or 'stdio'"
+          ]
+        },
+        "streamablehttp": {
+          "status": 422,
+          "msg": [
+            "Input should be 'sse' or 'stdio'"
+          ]
+        },
+        "http": {
+          "status": 422,
+          "msg": [
+            "Input should be 'sse' or 'stdio'"
+          ]
+        },
+        "streamable": {
+          "status": 422,
+          "msg": [
+            "Input should be 'sse' or 'stdio'"
+          ]
+        }
+      }
+    },
+    {
+      "check": "sse",
+      "result": {
+        "coingecko_sse": {
+          "create_status": 201,
+          "test_status": 200,
+          "test": {
+            "success": true,
+            "message": "Connection successful",
+            "tools_count": 2
+          },
+          "test_s": 1.6
+        },
+        "coingecko_mcp": {
+          "create_status": 201,
+          "test_status": 200,
+          "test": {
+            "success": false,
+            "message": "unhandled errors in a TaskGroup (1 sub-exception)",
+            "tools_count": null
+          },
+          "test_s": 0.94
+        },
+        "atlassian": {
+          "create_status": 201,
+          "test_status": 200,
+          "test": {
+            "success": false,
+            "message": "unhandled errors in a TaskGroup (1 sub-exception)",
+            "tools_count": null
+          },
+          "test_s": 1.27
+        },
+        "notion": {
+          "create_status": 201,
+          "test_status": 200,
+          "test": {
+            "success": false,
+            "message": "unhandled errors in a TaskGroup (1 sub-exception)",
+            "tools_count": null
+          },
+          "test_s": 0.66
+        },
+        "asana": {
+          "create_status": 201,
+          "test_status": 200,
+          "test": {
+            "success": false,
+            "message": "unhandled errors in a TaskGroup (1 sub-exception)",
+            "tools_count": null
+          },
+          "test_s": 0.75
+        }
+      }
+    },
+    {
+      "check": "fields",
+      "result": {
+        "create_status": 201,
+        "create_keys": [
+          "args",
+          "cached_tools",
+          "command",
+          "connection_url",
+          "created_at",
+          "created_by",
+          "description",
+          "enabled",
+          "env_vars",
+          "id",
+          "last_connected_at",
+          "mcp_server_id",
+          "name",
+          "org_id",
+          "transport_type",
+          "updated_at"
+        ],
+        "list_keys": [
+          "args",
+          "cached_tools",
+          "command",
+          "connection_url",
+          "created_at",
+          "created_by",
+          "description",
+          "enabled",
+          "env_vars",
+          "id",
+          "last_connected_at",
+          "mcp_server_id",
+          "name",
+          "org_id",
+          "transport_type",
+          "updated_at"
+        ],
+        "extra_keys_stored": [],
+        "canary_values_echoed": [],
+        "test": {
+          "success": true,
+          "message": "Connection successful (could not enumerate tools)",
+          "tools_count": null
+        }
+      }
+    },
+    {
+      "check": "python_stdio_bridge",
+      "result": {
+        "create_status": 201,
+        "test_status": 200,
+        "test": {
+          "success": true,
+          "message": "Connection successful",
+          "tools_count": 3
+        },
+        "test_s": 1.9
+      }
+    },
+    {
+      "check": "live_schema",
+      "result": {
+        "status": 200,
+        "create": {
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 100,
+              "minLength": 1,
+              "title": "Name"
+            },
+            "description": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Description"
+            },
+            "transport_type": {
+              "type": "string",
+              "enum": [
+                "sse",
+                "stdio"
+              ],
+              "title": "Transport Type",
+              "description": "`sse` for a remote server reached over HTTP, `stdio` for a local process."
+            },
+            "connection_url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Connection Url",
+              "description": "Required when `transport_type` is `sse`."
+            },
+            "command": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Command",
+              "description": "Required when `transport_type` is `stdio`."
+            },
+            "args": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Args"
+            },
+            "env_vars": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Env Vars",
+              "description": "Environment for the server process. WRITE-ONLY: values set here are never echoed back by the read routes."
+            },
+            "enabled": {
+              "type": "boolean",
+              "title": "Enabled",
+              "default": true
+            }
+          },
+          "type": "object",
+          "required": [
+            "name",
+            "transport_type"
+          ],
+          "title": "McpServerCreateRequest",
+          "description": "An MCP server an agent can call tools on.\n\n`org_id` is deliberately ABSENT even though voice's model requires it: it\nis pinned from the API key by the router and a body-supplied value would be\na tenancy hole."
+        },
+        "mcp_paths": [
+          "/voice/mcp-servers",
+          "/voice/mcp-servers/{mcp_server_id}",
+          "/voice/mcp-servers/{mcp_server_id}/tools/cached",
+          "/voice/mcp-servers/{mcp_server_id}/tools",
+          "/voice/mcp-servers/{mcp_server_id}/test",
+          "/workflows/mcp-servers"
+        ]
+      }
+    },
+    {
+      "check": "existing_servers",
+      "result": []
+    },
+    {
+      "check": "workflow_definition",
+      "result": {
+        "id": "2c21f971-9ceb-4433-bc15-63fa3fa9cc4e",
+        "status": 404,
+        "config": null
+      }
+    },
+    {
+      "check": "workflow_runs",
+      "result": {
+        "workflow_id": "2c21f971-9ceb-4433-bc15-63fa3fa9cc4e",
+        "http_status": 200,
+        "runs": [
+          {
+            "execution_id": "6f0fef68-7e13-4c40-996c-32b770ac0cd7",
+            "status": "completed",
+            "nodes": {
+              "gh_1": {
+                "status": "completed",
+                "duration_ms": 13582,
+                "tool": "github_list_pull_requests",
+                "mcp_server": "reseau-gateway",
+                "is_error": false,
+                "contains_pr_14": true
+              },
+              "lin_1": {
+                "status": "completed",
+                "duration_ms": 18361,
+                "tool": "linear_list_issues",
+                "mcp_server": "reseau-gateway",
+                "is_error": false,
+                "contains_har_90": true
+              },
+              "trigger_1": {
+                "status": "completed",
+                "duration_ms": 0
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "check": "workflow_definition",
+      "result": {
+        "id": "39682a7e-3e95-4c86-a399-14597316d7ec",
+        "status": 404,
+        "config": null
+      }
+    },
+    {
+      "check": "workflow_runs",
+      "result": {
+        "workflow_id": "39682a7e-3e95-4c86-a399-14597316d7ec",
+        "http_status": 200,
+        "runs": [
+          {
+            "execution_id": "68f46b6c-e6e4-4638-88f7-277afa34ae4d",
+            "status": "completed",
+            "nodes": {
+              "gh_1": {
+                "status": "completed",
+                "duration_ms": 7109,
+                "tool": "github_list_pull_requests",
+                "mcp_server": "reseau-gateway",
+                "is_error": false,
+                "contains_pr_14": true
+              },
+              "lin_1": {
+                "status": "completed",
+                "duration_ms": 11087,
+                "tool": "linear_list_issues",
+                "mcp_server": "reseau-gateway",
+                "is_error": false,
+                "contains_har_90": true
+              },
+              "agent_1": {
+                "status": "completed",
+                "duration_ms": 7149
+              },
+              "merge_1": {
+                "status": "completed",
+                "duration_ms": 392
+              },
+              "trigger_1": {
+                "status": "completed",
+                "duration_ms": 0
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "check": "cleanup",
+      "result": {
+        "leftovers": []
+      }
+    },
+    {
+      "check": "direct",
+      "result": {
+        "coingecko": {
+          "sse_tools": [
+            "execute",
+            "search_docs"
+          ],
+          "mcp_tools": [
+            "execute",
+            "search_docs"
+          ],
+          "same": true
+        },
+        "github_unauth": {
+          "status": 401,
+          "ct": "text/plain",
+          "www-authenticate": "Bearer error=\"invalid_request\", error_description=\"No access token was provided in this request\", resource_metadata=\"https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/\""
+        },
+        "linear_unauth": {
+          "status": 401,
+          "ct": "",
+          "www-authenticate": "Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp\", scope=\"read write\""
+        },
+        "graph8_unauth": {
+          "status": 401,
+          "ct": "application/json",
+          "www-authenticate": "Bearer resource_metadata=\"https://be.graph8.com/.well-known/oauth-protected-resource\""
+        },
+        "linear_sse_get": {
+          "status": 404,
+          "ct": "text/plain",
+          "www-authenticate": null
+        },
+        "upstream_full_counts": {
+          "github": 45,
+          "linear": 59,
+          "graph8": 126
+        },
+        "upstream_full_total": 230,
+        "raw_collisions_github_linear": [
+          "list_issues",
+          "list_releases"
+        ],
+        "gateway_exposed": {
+          "count": 14,
+          "names": [
+            "g8_current_org",
+            "github_get_commit",
+            "github_get_me",
+            "github_issue_read",
+            "github_list_commits",
+            "github_list_issues",
+            "github_list_pull_requests",
+            "github_pull_request_read",
+            "linear_get_issue",
+            "linear_get_project",
+            "linear_list_comments",
+            "linear_list_issues",
+            "linear_list_projects",
+            "linear_list_teams"
+          ]
+        }
+      }
+    },
+    {
+      "check": "runtime_report",
+      "result": {
+        "status": 200,
+        "body": {
+          "data": {
+            "items": [
+              {
+                "name": "runtime_report",
+                "description": "{\"npx\": false, \"uvx\": false, \"node\": false, \"mcp-proxy\": false, \"python3\": true, \"sh\": true, \"bash\": true, \"mcp_proxy_importable\": false}",
+                "input_schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            ],
+            "mcp_server_id": "0ec108fc-9133-4343-ae0c-2e3994fd52d2",
+            "mcp_server_name": "reseau-claims-9f981d-runtime-report",
+            "tools": [
+              {
+                "name": "runtime_report",
+                "description": "{\"npx\": false, \"uvx\": false, \"node\": false, \"mcp-proxy\": false, \"python3\": true, \"sh\": true, \"bash\": true, \"mcp_proxy_importable\": false}",
+                "input_schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            ],
+            "total": 1
+          },
+          "pagination": null
+        }
+      }
+    },
+    {
+      "check": "oauth_challenges",
+      "result": {
+        "atlassian": {
+          "status": 401,
+          "ct": "application/json",
+          "www-authenticate": "Bearer realm=\"OAuth\", error=\"invalid_token\", error_description=\"Missing or invalid access token\""
+        },
+        "notion": {
+          "status": 401,
+          "ct": "application/json",
+          "www-authenticate": "Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.notion.com/.well-known/oauth-protected-resource/sse\", error=\"invalid_token\", error_description=\"Missing or invalid access token\""
+        },
+        "asana": {
+          "status": 401,
+          "ct": "application/json",
+          "www-authenticate": "Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.asana.com/.well-known/oauth-protected-resource\", error=\"invalid_token\", error_description=\"Missing or invalid access token\""
+        }
+      }
+    },
+    {
+      "check": "inbound_metadata",
+      "result": {
+        "status": 200,
+        "resource": "https://be.graph8.com/mcp",
+        "authorization_servers": [
+          "https://auth.graph8.com/oauth/2.1"
+        ]
+      }
+    },
+    {
+      "check": "readonly_counts",
+      "result": {
+        "github": 27,
+        "linear": 35
+      }
+    }
+  ]
+}
