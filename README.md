@@ -39,10 +39,11 @@ cp .env.example .env   # then fill it in
 
 ```sh
 set -a; . ./.env; set +a
-uv run python -m reseau.front --host 0.0.0.0 --port 8080
+uv run python -m reseau.front --port 8080        # binds 127.0.0.1
 ```
 
-The gateway must be reachable from the public internet. For a quick test, use a tunnel:
+Réseau runs locally only; there is no deployed instance. Graph8 calls the gateway from its own servers, so
+open a tunnel while Graph8 needs it, and close it when you're done:
 `ssh -R 80:localhost:8080 nokey@localhost.run`.
 
 ## Register with Graph8
@@ -61,13 +62,16 @@ then deletes the record and verifies that it's gone.
 - **The token is in the URL.** A Graph8 registration can only carry `connection_url`, so the gateway token
   goes in the path. It's checked on the SSE stream and on every message POST, compared in constant time, and
   a wrong token gets a plain 404.
-- **Graph8 shows the URL to everyone in the org.** Its read route (`GET /api/v1/workflows/mcp-servers`)
-  returns `connection_url` in plaintext, so anyone with an org key can read the token. The token only
-  unlocks the gateway's read-only, allowlisted tools. Rotate it when a registration is removed:
-  put the new token first in `RESEAU_GATEWAY_TOKEN`, re-register, then drop the old one.
-  This is an accepted exception: HAR-96's criterion reads "no *upstream* credentials in Graph8 read
-  responses". Graph8 returns every registration field, so no registration can hide a secret today. The
-  proposed Graph8 fix is in `upstream/graph8_mcp_read_redaction/`.
+- **Known gap: Graph8 shows the token to everyone in the org.** Its read route
+  (`GET /api/v1/workflows/mcp-servers`) returns `connection_url` in plaintext while a registration exists,
+  so anyone with an org key can read the token. This breaks HAR-96's original criterion "no credentials in
+  Graph8 read responses", and nothing on Réseau's side can close it: Graph8 returns every registration field,
+  so no registration can hide a secret. It stays open until Graph8 ships the fix proposed in
+  `upstream/graph8_mcp_read_redaction/` (HAR-111). Until then, keep the exposure small:
+  - Upstream tokens never reach Graph8. The gateway token only unlocks read-only, allowlisted tools.
+  - A leaked token is useless while the tunnel is down, and the tunnel only runs while Graph8 needs it.
+  - Use a fresh `RESEAU_GATEWAY_TOKEN` each session, and let `register_graph8` delete the record (no `--keep`)
+    unless an agent needs it.
 - **Tokens stay out of logs and output.** Every upstream token and gateway token is redacted from all log
   records, tool results and errors, and uvicorn's access log is off.
 
