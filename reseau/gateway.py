@@ -13,10 +13,10 @@ HTTP methods, the MCP handshake/listing methods, and the upstream's bootstrap to
 retried on 429 only, and only on a read_only upstream: a 429 is refused before the tool runs, so repeating it
 can't double-apply. Never on 5xx, which may come after the tool ran.
 
-A network error (connection dropped or refused, no response) is retried wherever the request is retried at all,
-read_only tools/call included: repeating a read is harmless. Otherwise it fails that one request, as a 502. It is
-never raised into the SDK: an exception in one request's POST ends the SDK's whole session, and with it every
-call in flight and every call after it.
+A network error, before the response or partway through its body, is retried wherever the request is retried
+at all, read_only tools/call included: repeating a read is harmless. Otherwise it fails that one request, as a 502.
+It is never raised into the SDK: an exception in one request's POST ends the SDK's whole session, and with it
+every call in flight and every call after it. So _Reliable reads each answer itself, inside its retry loop.
 
 Secrets: tokens go into request headers only. Every error message built here names the env var,
 never its value. Tool results and upstream errors are scrubbed of every known token before they are
@@ -25,7 +25,7 @@ returned, and install_log_redaction() (run by Gateway) scrubs every log record i
 import json
 import logging
 import os
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass
 
 import anyio
@@ -266,30 +266,6 @@ class _Conn:
                              up.name, "unavailable")
 
 
-class _SlotStream(httpx2.AsyncByteStream):
-    """Response body that frees its concurrency slot when closed, so the cap covers the whole exchange
-    (a Streamable HTTP POST can answer with SSE headers first and the tool result much later)."""
-
-    def __init__(self, stream, release):
-        self.stream, self.release = stream, release
-
-    async def __aiter__(self):
-        try:
-            async for chunk in self.stream:
-                yield chunk
-        except httpx2.TransportError as exc:
-            # The SDK fails one response on a StreamError; any other exception ends its whole session.
-            raise httpx2.StreamError("%s: %s" % (type(exc).__name__, redact(str(exc), SECRETS))) from exc
-
-    async def aclose(self):
-        try:
-            await self.stream.aclose()
-        finally:
-            if self.release:
-                self.release, release = None, self.release
-                release()
-
-
 def no_response(request, exc):
     """A request that got no HTTP response, as a 502 carrying a JSON-RPC error that names the cause. The SDK
     fails just that request with it (a notification's is dropped), and the 502 makes classify() report it as
@@ -298,9 +274,45 @@ def no_response(request, exc):
         "code": INTERNAL_ERROR, "message": "%s: %s" % (type(exc).__name__, redact(str(exc), SECRETS))}})
 
 
+def answers(event):
+    """Whether one SSE event carries a JSON-RPC response (result or error), not a notification or a request."""
+    try:
+        msg = outbound._parse_sse(event.decode("utf-8", "replace"))
+    except ValueError:
+        return False
+    return isinstance(msg, dict) and ("result" in msg or "error" in msg)
+
+
+async def read_answer(request, resp):
+    """resp read into memory: the whole body, or an event stream up to the event that answers the request (a
+    server may hold the stream open after it). A drop partway through raises here, where _Reliable can retry it.
+    Anything the server streams before its answer arrives with the answer, not before it; the gateway's client
+    declares no capability (sampling, elicitation, roots) that would have a server wait on the client mid-call."""
+    sse = resp.headers.get("content-type", "").lower().startswith("text/event-stream")
+    resp.request = request
+    body, pending = [], b""
+    try:
+        async for chunk in resp.aiter_bytes():
+            body.append(chunk)
+            if sse:
+                *events, pending = (pending + chunk).replace(b"\r\n", b"\n").split(b"\n\n")
+                if any(map(answers, events)):
+                    break
+    finally:
+        await resp.aclose()
+    # aiter_bytes decoded the body; httpx2 frames the copy itself
+    headers = [(k, v) for k, v in resp.headers.multi_items()
+               if k.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+    return httpx2.Response(resp.status_code, headers=headers, content=b"".join(body), request=request)
+
+
 class _Reliable(httpx2.AsyncBaseTransport):
-    """outbound.Client's policy for the SDK's async httpx transport. outbound.Client itself is sync and
-    buffers bodies, which the SDK's streaming (SSE) exchange can't use; the rules are shared, not copied."""
+    """outbound.Client's policy for the SDK's async httpx transport; the rules are shared, not copied.
+
+    Every exchange but the standalone GET stream is read whole here, under its concurrency slot and inside the
+    retry loop: the cap covers the whole exchange (an SSE answer can follow its headers much later), and a
+    network error at any point, before the response or partway through its body, is retried or answered with
+    a 502. Never raised into the SDK, which would end the session and every call on it."""
 
     def __init__(self, slots, retry_tools=frozenset(), read_only=False, inner=None):
         self.slots, self.retry_tools, self.read_only = slots, retry_tools, read_only
@@ -323,34 +335,29 @@ class _Reliable(httpx2.AsyncBaseTransport):
         return outbound.RETRY_STATUSES if msg.get("method") in outbound.SAFE_MCP_METHODS else ()
 
     async def handle_async_request(self, request):
-        # The standalone GET SSE stream stays open for the whole session; capping it would pin a slot forever.
+        # The standalone GET SSE stream stays open for the whole session: capping it would pin a slot forever,
+        # and it is never read here.
+        stream = request.method == "GET"
         key = outbound.host_key(str(request.url))
-        slot = None if request.method == "GET" else self.slots.setdefault(
-            key, anyio.Semaphore(outbound.max_per_host(key)))
+        slot = nullcontext() if stream else self.slots.setdefault(key, anyio.Semaphore(outbound.max_per_host(key)))
         retry_on = self._retry_statuses(request)
         attempt = 0
         while True:
             attempt += 1
-            if slot:
-                await slot.acquire()
             try:
-                resp = await self.inner.handle_async_request(request)
-            except BaseException as exc:
-                if slot:
-                    slot.release()
-                if not isinstance(exc, httpx2.TransportError):
-                    raise
-                # No response at all. Retried wherever this request is retried at all; a read timeout already
-                # waited 300 s, so it isn't. Raised, the error would end the SDK's session and every call on it.
+                async with slot:
+                    resp = await self.inner.handle_async_request(request)
+                    if not stream:
+                        resp = await read_answer(request, resp)
+            except httpx2.TransportError as exc:
+                # No answer. Retried wherever this request is retried at all; a read timeout already waited 300 s,
+                # so it isn't.
                 wait = RETRY_POLICY.delay(attempt) if retry_on and not isinstance(exc, httpx2.ReadTimeout) else None
                 if wait is None:
                     return no_response(request, exc)
                 log.warning("retrying %s %s in %.2fs after %s", request.method, request.url, wait, type(exc).__name__)
                 await anyio.sleep(wait)
                 continue
-            if slot:
-                # ponytail: a response the caller never closes leaks its slot; the SDK always closes them.
-                resp.stream = _SlotStream(resp.stream, slot.release)
             wait = None
             if resp.status_code in retry_on:
                 wait = RETRY_POLICY.delay(attempt, outbound.parse_retry_after(resp.headers.get("retry-after")))

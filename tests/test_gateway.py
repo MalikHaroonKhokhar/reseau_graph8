@@ -450,7 +450,8 @@ def test_per_host_concurrency_cap(monkeypatch, caps, peak):
 
 
 class Replies(httpx2.AsyncBaseTransport):
-    """An inner transport answering with the given (status, headers), one per request; an exception is raised."""
+    """An inner transport answering with the given (status, headers), one per request; an exception is raised,
+    a Response returned as is."""
 
     def __init__(self, *replies):
         self.replies, self.sent = list(replies), 0
@@ -460,6 +461,8 @@ class Replies(httpx2.AsyncBaseTransport):
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
+        if isinstance(reply, httpx2.Response):
+            return reply
         status, headers = reply
         return httpx2.Response(status, headers=headers, stream=httpx2.ByteStream(b"{}"))  # streamed, like a real one
 
@@ -507,33 +510,62 @@ def test_429_on_tool_call_is_retried_on_a_read_only_upstream():
 # ---- a network error fails one request, never the session ----
 
 DISCONNECTED = httpx2.RemoteProtocolError("Server disconnected without sending a response.")
+RESET = httpx2.ReadError("peer closed connection")
+
+
+class CutShort(httpx2.AsyncByteStream):
+    """A body that breaks after its first few bytes, before the answer."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    async def __aiter__(self):
+        async for chunk in self.stream:
+            yield chunk[:8]
+            raise RESET
+
+    async def aclose(self):
+        await self.stream.aclose()
 
 
 @pytest.fixture
 def drops(monkeypatch):
-    """The real transport, except that the next `n` tools/call POSTs lose their connection before any response."""
-    left = {"n": 0}
+    """The real transport, except that the next `n` tools/call POSTs lose their connection: before any response,
+    or with `mid` set, partway through the answer's event stream."""
+    left = {"n": 0, "mid": False}
     real = httpx2.AsyncHTTPTransport
 
     class Dropping(real):
         async def handle_async_request(self, request):
-            if request.method == "POST" and b'"tools/call"' in request.content and left["n"]:
-                left["n"] -= 1
+            if not (request.method == "POST" and b'"tools/call"' in request.content and left["n"]):
+                return await super().handle_async_request(request)
+            left["n"] -= 1
+            if not left["mid"]:
                 raise DISCONNECTED
-            return await super().handle_async_request(request)
+            resp = await super().handle_async_request(request)
+            assert resp.headers["content-type"].startswith("text/event-stream")  # a streamed answer, like GitHub's
+            resp.stream = CutShort(resp.stream)
+            return resp
 
     monkeypatch.setattr(gateway.httpx2, "AsyncHTTPTransport", Dropping)
     return left
 
 
 TIMED_OUT = httpx2.ReadTimeout("timed out")
+ANSWER = b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+
+
+def cut_answer():
+    return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=CutShort(httpx2.ByteStream(ANSWER)))
 
 
 @pytest.mark.parametrize("method, read_only, replies, sent, waits, status", [
     ("tools/call", True, [DISCONNECTED, (200, {})], 2, 1, 200),  # a read repeats harmlessly
-    ("tools/call", True, [DISCONNECTED] * outbound.MAX_ATTEMPTS, outbound.MAX_ATTEMPTS, 3, 502),  # gives up
-    ("tools/call", True, [TIMED_OUT], 1, 0, 502),  # already waited out the read timeout: not again
-    ("tools/call", False, [DISCONNECTED], 1, 0, 502),  # may have run on an upstream with write tools
+    ("tools/call", True, [cut_answer(), (200, {})], 2, 1, 200),  # partway through its answer, too
+    ("tools/call", True, [DISCONNECTED] * outbound.MAX_ATTEMPTS, outbound.MAX_ATTEMPTS, 3, "502 RemoteProtocolError"),
+    ("tools/call", True, [TIMED_OUT], 1, 0, "502 ReadTimeout"),  # already waited out the read timeout: not again
+    ("tools/call", False, [DISCONNECTED], 1, 0, "502 RemoteProtocolError"),  # may have run: write tools upstream
+    ("tools/call", False, [cut_answer()], 1, 0, "502 ReadError"),
     ("initialize", False, [httpx2.ConnectError("refused"), (200, {})], 2, 1, 200),  # the handshake always is
 ])
 def test_network_error_is_retried_where_the_request_is_or_answered_as_a_502(monkeypatch, method, read_only,
@@ -555,34 +587,45 @@ def test_network_error_is_retried_where_the_request_is_or_answered_as_a_502(monk
         return resp.status_code, json.loads(body)
 
     got, body = run(go())
-    assert (got, inner.sent, len(slept)) == (status, sent, waits)
-    if status == 502:  # a JSON-RPC error the SDK hands to this one request; not -32003, Graph8's org gate
+    assert (got, inner.sent, len(slept)) == (int(str(status)[:3]), sent, waits)
+    if got == 502:  # a JSON-RPC error the SDK hands to this one request; not -32003, Graph8's org gate
         assert body["error"]["code"] == -32603
-        assert body["error"]["message"].startswith(type(replies[-1]).__name__ + ": ")
+        assert body["error"]["message"].startswith(status.split()[1] + ": ")
     [slot] = slots.values()
     assert slot.value == outbound.HOST_CAPS["api.githubcopilot.com"]  # every attempt gave its slot back
 
 
-def test_a_body_cut_off_mid_read_fails_that_response_only():
-    class Cut(httpx2.AsyncByteStream):
-        async def __aiter__(self):
-            yield b'{"jsonrpc"'
-            raise httpx2.ReadError("connection reset")
+class Held(httpx2.AsyncByteStream):
+    """A server that streams a notification, then its answer split across chunks, then holds the stream open."""
 
-        async def aclose(self):
-            pass
+    closed = False
 
-    released = []
-    stream = gateway._SlotStream(Cut(), lambda: released.append(1))
+    async def __aiter__(self):
+        yield b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{}}\r\n\r\n'
+        yield b'event: message\r\ndata: {"jsonrpc":"2.0","id":1,'
+        yield b'"result":{"content":[]}}\r'
+        yield b'\n\r\n'
+        while True:
+            await anyio.sleep(3600)
+            yield b": ping\n\n"
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_an_answer_is_read_up_to_its_event_even_if_the_stream_stays_open():
+    held = Held()
+    request = httpx2.Request("POST", "https://api.githubcopilot.com/mcp/readonly", content=b"{}")
 
     async def go():
-        with pytest.raises(httpx2.StreamError, match="ReadError: connection reset"):  # what the SDK fails one response on
-            async for _ in stream:
-                pass
-        await stream.aclose()
+        with anyio.fail_after(5):  # stops at the answer, not at the end of a stream that never ends
+            return await gateway.read_answer(request, httpx2.Response(
+                200, headers={"content-type": "text/event-stream", "mcp-session-id": "s1"}, stream=held))
 
-    run(go())
-    assert released == [1]
+    resp = run(go())
+    assert held.closed and resp.headers["mcp-session-id"] == "s1"
+    assert resp.content.endswith(b'"result":{"content":[]}}\r\n\r\n')  # the notification before it is kept
+    assert resp.content.startswith(b'data: {"jsonrpc":"2.0","method":"notifications/message"')
 
 
 def test_a_crashed_session_names_its_cause():
@@ -591,13 +634,14 @@ def test_a_crashed_session_names_its_cause():
     assert err.message == "github: upstream unavailable (ConnectError)"
 
 
+@pytest.mark.parametrize("mid", [False, True], ids=["before_response", "mid_stream"])
 @pytest.mark.parametrize("read_only", [True, False])
-def test_red_a_dropped_connection_fails_one_call_not_the_session(drops, read_only):
+def test_red_a_dropped_connection_fails_one_call_not_the_session(drops, read_only, mid):
     async def go():
         with MockUpstream(GH_TOKEN, stateless=False) as gh:
             up = Upstream("github", gh.url, "GITHUB_MCP_TOKEN", read_only=read_only)
             async with Gateway([up], {"GITHUB_MCP_TOKEN": GH_TOKEN}) as gw:
-                drops["n"] = 1
+                drops["n"], drops["mid"] = 1, mid
                 try:
                     first = (await gw.call_tool("github", "echo", {"text": "a"})).content[0].text
                 except MCPError as e:
@@ -609,7 +653,7 @@ def test_red_a_dropped_connection_fails_one_call_not_the_session(drops, read_onl
         assert first == "echo:a"
     else:  # the tool may have run: not repeated, and the error says what happened
         assert isinstance(first, UpstreamError) and first.data["kind"] == "unavailable"
-        assert "RemoteProtocolError: Server disconnected" in first.message
+        assert ("ReadError: peer closed" if mid else "RemoteProtocolError: Server disconnected") in first.message
     assert (second, health["github"]["ok"]) == ("echo:b", True)  # the session survived
 
 
@@ -626,12 +670,13 @@ def test_a_dropped_graph8_call_is_not_mistaken_for_its_org_gate(drops):
     err, org_calls = run(go())
     assert (err.data["kind"], org_calls) == ("unavailable", 1)  # not re-bootstrapped, and echo not repeated
 
-def test_concurrent_reads_all_survive_a_dropped_connection(drops):
+@pytest.mark.parametrize("mid", [False, True], ids=["before_response", "mid_stream"])
+def test_concurrent_reads_all_survive_a_dropped_connection(drops, mid):
     async def go():
         with MockUpstream(GH_TOKEN, stateless=False) as gh:
             up = Upstream("github", gh.url, "GITHUB_MCP_TOKEN", read_only=True)
             async with Gateway([up], {"GITHUB_MCP_TOKEN": GH_TOKEN}) as gw:
-                drops["n"] = 2
+                drops["n"], drops["mid"] = 2, mid
                 out = {}
 
                 async def call(i):
