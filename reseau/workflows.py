@@ -1,5 +1,5 @@
-"""Graph8 workflows over the gateway: Start My Day (HAR-102) and the team daily report (HAR-103). Neither returns
-a sentence that reseau/verify.py hasn't checked against the tool output of the same run.
+"""Graph8 workflows over the gateway: Start My Day (HAR-102), the team daily report (HAR-103) and Ask Réseau
+(HAR-104). None returns a sentence that reseau/verify.py hasn't checked against the tool output of the same run.
 
 Mechanism (HAR-91, spikes/graph8_agent_run/FINDINGS.md): a workflow whose MCP `tool` node calls a gateway tool
 (get_my_day_context; get_team_summary with the trigger's date), then an `agent` node writes sections of
@@ -7,14 +7,21 @@ sentences, each with the activity_ids it cites. The tool output reaches the agen
 input_mappings (instructions are never interpolated, and only a bare ${node.field} resolves). A trigger executes
 the workflow over REST, polls the execution, and returns the sections only once they pass verification.
 
-    python -m reseau.workflows setup                     # the voice agent and both workflows over "reseau-gateway"
+Ask Réseau: a tool node's mcp_tool_name is not interpolated (live 2026-09-27: "${trigger.tool}" failed where the
+same call with the name written out returned), and Graph8's agent node can't call MCP tools itself (HAR-91). So a
+Graph8 agent chooses the tool in a route workflow, and each semantic tool has its own answer workflow: the
+tool, a run_javascript node that joins the question to its output, and an agent that answers from it. The
+route agent is offered the semantic tools only; a route to anything else is refused before any tool runs.
+
+    python -m reseau.workflows setup                     # the voice agent and every workflow not set up yet
     python -m reseau.workflows update                    # push this code's prompts onto the existing ones
     python -m reseau.workflows start-my-day              # RESEAU_START_MY_DAY = its action_id
     python -m reseau.workflows daily-report YYYY-MM-DD   # RESEAU_DAILY_REPORT = its action_id
+    python -m reseau.workflows ask "QUESTION"            # RESEAU_ASK = route=<action_id>,<tool>=<action_id>,...
     python -m reseau.workflows verify EXECUTION_ID       # check any run, e.g. one started from Graph8's dashboard
 
 All need GRAPH8_API_KEY. The gateway must be registered and reachable (python -m reseau.tunnel, README).
-Each run is billable: the agent node costs ~12 credits.
+Each run is billable: an agent node costs ~12 credits, and a question runs two.
 """
 import json
 import os
@@ -23,10 +30,12 @@ import time
 from datetime import date as Date
 from functools import partial
 
-from reseau import verify
+from reseau import evidence, semantic, verify
 
 START_MY_DAY_ENV = "RESEAU_START_MY_DAY"
 REPORT_ENV = "RESEAU_DAILY_REPORT"
+ASK_ENV = "RESEAU_ASK"
+ENVS = (START_MY_DAY_ENV, REPORT_ENV, ASK_ENV)
 SECTIONS = {"summary": "Summary", "focus": "Focus today", "needs_attention": "Needs attention",
             "yesterday": "Yesterday"}
 REPORT_SECTIONS = {"summary": "Summary", "completed": "Completed", "merged": "Merged", "commits": "Commits",
@@ -88,10 +97,69 @@ Never write an id that is not in the JSON.
 [{"text": "Nothing to report.", "activity_ids": []}]. The summary is that too when there is no activity at all.
 - Plain sentences: no greetings, sign-offs, headings, markdown, dates, or activity_ids inside text."""
 
+DECLINE = "No evidence found."
+# The tools Ask Réseau can reach, each through its own answer workflow: the semantic tools and get_evidence. The
+# gateway's raw github_*, linear_* and g8_* tools are left out (deck slide 7).
+ASK_TOOLS = {t.name: t for t in [*semantic.TOOLS, evidence.TOOL]}
+
+ROUTE_INSTRUCTIONS = """You route one question about a software team's work to the one Réseau tool that answers \
+it. The user message is one JSON document: {"question", "today" (YYYY-MM-DD), "timezone", "people", "projects"}.
+
+Reply with only this JSON object, no code fences and no other text:
+{"tool": "<tool name>", "arguments": {"<argument>": "<string>", ...}}
+or, when none of the tools can answer the question, {"tool": null, "arguments": {}}.
+
+The tools:
+%s
+
+- person is one of "people", exactly as written there. A question about anyone not listed there gets \
+{"tool": null, "arguments": {}}.
+- project is one of "projects", and only when the question names it.
+- date is YYYY-MM-DD, worked out from "today": yesterday is the day before it. With no day in the question, use \
+today.
+- activity_id is linear:issue:ENG-142 for a Linear issue key like ENG-142, and github:pr:owner/repo#9 for a pull \
+request.
+- What blocks an issue, named by key or by title: get_project_context when the question names a project in \
+"projects", otherwise get_team_summary with today's date (its blocked list holds every blocked issue of the team).
+- Why a work item matters, or which customer, deal or commitment waits on it: get_business_context.
+- Anything these tools don't cover (money, the weather, opinions, predictions, general knowledge): \
+{"tool": null, "arguments": {}}. Never guess.
+
+Examples, with today 2026-09-27 and "ana" in people:
+- "What is blocking the checkout page?" -> {"tool": "get_team_summary", "arguments": {"date": "2026-09-27"}}
+- "What did ana do yesterday?" -> {"tool": "get_person_activity", "arguments": {"person": "ana", "date": "2026-09-26"}}
+- "Why does ENG-142 matter?" -> {"tool": "get_business_context", "arguments": {"activity_id": "linear:issue:ENG-142"}}
+- "What is our revenue?" -> {"tool": null, "arguments": {}}""" % "\n".join(
+    "- %s(%s): %s" % (t.name, ", ".join(t.input_schema["properties"]), t.description) for t in ASK_TOOLS.values())
+
+ANSWER_INSTRUCTIONS = """You answer one question about a software team's work. The user message is the question, \
+then the JSON output of the Réseau tool that was called for it. That JSON is your only source of facts. Never add \
+facts, guesses, advice, estimates or anything else it does not state, and never answer from general knowledge.
+
+Reply with only this JSON object, no code fences and no other text:
+{"answer": [S, ...]}
+Each S is {"text": "<exactly one sentence>", "activity_ids": ["<activity_id>", ...]}.
+
+- One to five sentences that answer the question directly. Each one mentions at most 6 items, and its \
+activity_ids lists the activity_id of every item it mentions, copied character for character from the JSON. \
+Never write an id that is not in the JSON. With more items than that, name the ones that answer the question best.
+- Blocked work: name every issue in its blocked_by by identifier (HAR-6 for linear:issue:HAR-6) and the pull \
+requests it waits on (blocking_prs) by number, and cite them all.
+- Business context: name the customers, opportunities and commitments in links, citing their graph8: \
+activity_ids. If links is empty (reason no_link_found), say in one sentence that no Graph8 customer, opportunity \
+or commitment is linked to the work item, citing the work item's activity_id.
+- State a number only when the JSON states it (a count field, or the length of a list), in digits. Never count \
+items yourself: name them instead, e.g. "haroon completed HAR-86 and HAR-87 and merged PR #20."
+- Inside text, quote a title with single quotes ('like this'), never double quotes.
+- If nothing in the JSON answers the question, reply exactly \
+{"answer": [{"text": "%s", "activity_ids": []}]}.
+- Plain sentences: no greetings, sign-offs, headings, markdown, or activity_ids inside text.""" % DECLINE
+
 # The agent node runs a voice agent; its persona leaks into replies, so this one is neutral (HAR-91 addendum).
 AGENT = {"entity_type": "agent", "agent_status": "inactive", "role": "Assistant", "use_company_knowledge": False,
          "identity": {}, "persona": {
-             "agent_name": "reseau-workflows", "description": "Réseau's Start My Day briefings and daily reports",
+             "agent_name": "reseau-workflows",
+             "description": "Réseau's Start My Day briefings, daily reports and Ask Réseau answers",
              "persona": "You turn tool output into clear, readable, factual JSON. No greetings, no sign-offs.",
              "assertiveness_level": 0.5, "conciseness_level": 0.7, "formality_level": 0.5}}
 
@@ -113,18 +181,29 @@ def chain(nodes):
     return {"start_node_id": nodes[0]["node_id"], "nodes": nodes, "edges": edges}
 
 
+def trigger_node(inputs):
+    return {"node_id": "trigger_1", "name": "trigger_1", "node_type": "trigger",
+            "config": {"trigger_type": "tool_call",
+                       "input_schema": {"type": "object", "properties": {k: {"type": "string"} for k in inputs}}}}
+
+
+def tool_node(server_id, node, tool, inputs):
+    """An MCP call on the gateway whose arguments are the trigger inputs of the same names."""
+    return {"node_id": node, "name": node, "node_type": "tool",
+            "config": {"tool": "mcp", "mcp_server_id": server_id, "mcp_tool_name": tool,
+                       "input_mappings": [{"source_expression": "${trigger.%s}" % k, "target_field": k} for k in inputs]}}
+
+
+def agent_node(agent_id, instructions, message):
+    return {"node_id": "agent_1", "name": "agent_1", "node_type": "agent",
+            "config": {"agent_id": agent_id, "instructions": instructions,
+                       "input_mappings": [{"source_expression": message, "target_field": "message"}]}}
+
+
 def tool_then_agent(server_id, agent_id, node, tool, instructions, inputs=()):
-    """trigger -> tool on the gateway -> agent. The tool's arguments are the trigger inputs of the same names."""
-    return chain([
-        {"node_id": "trigger_1", "name": "trigger_1", "node_type": "trigger",
-         "config": {"trigger_type": "tool_call",
-                    "input_schema": {"type": "object", "properties": {k: {"type": "string"} for k in inputs}}}},
-        {"node_id": node, "name": node, "node_type": "tool",
-         "config": {"tool": "mcp", "mcp_server_id": server_id, "mcp_tool_name": tool,
-                    "input_mappings": [{"source_expression": "${trigger.%s}" % k, "target_field": k} for k in inputs]}},
-        {"node_id": "agent_1", "name": "agent_1", "node_type": "agent",
-         "config": {"agent_id": agent_id, "instructions": instructions,
-                    "input_mappings": [{"source_expression": "${%s.content}" % node, "target_field": "message"}]}}])
+    """trigger -> tool on the gateway -> agent."""
+    return chain([trigger_node(inputs), tool_node(server_id, node, tool, inputs),
+                  agent_node(agent_id, instructions, "${%s.content}" % node)])
 
 
 def start_my_day_config(server_id, agent_id):
@@ -135,25 +214,73 @@ def daily_report_config(server_id, agent_id):
     return tool_then_agent(server_id, agent_id, "team_1", "get_team_summary", REPORT_INSTRUCTIONS, ["date"])
 
 
+def route_config(server_id, agent_id):
+    """trigger -> agent: the question and what arguments need (directory()) in, a tool and arguments out."""
+    return chain([trigger_node(["message"]), agent_node(agent_id, ROUTE_INSTRUCTIONS, "${trigger.message}")])
+
+
+def answer_config(tool, server_id, agent_id):
+    """trigger -> the one semantic tool -> the question joined to its output -> agent. The agent's message is a
+    single field and only a bare ${node.field} resolves, so a run_javascript node joins them (HAR-91 addendum)."""
+    params = list(ASK_TOOLS[tool].input_schema["properties"])
+    merge = {"node_id": "merge_1", "name": "merge_1", "node_type": "run_javascript",
+             "config": {"timeout_ms": 5000,
+                        "code": "return 'Question: ' + vars.question + '\\n\\nOutput of the %s tool:\\n' + vars.output;" % tool,
+                        "input_mappings": [{"source_expression": "${trigger.question}", "target_field": "question"},
+                                           {"source_expression": "${ask_1.content}", "target_field": "output"}]}}
+    return chain([trigger_node(["question", *params]), tool_node(server_id, "ask_1", tool, params), merge,
+                  agent_node(agent_id, ANSWER_INSTRUCTIONS, "${merge_1.result}")])
+
+
 WORKFLOWS = {START_MY_DAY_ENV: ("reseau-start-my-day", "Réseau Start My Day (HAR-102)", start_my_day_config),
              REPORT_ENV: ("reseau-daily-report", "Réseau team daily report (HAR-103)", daily_report_config)}
+# RESEAU_ASK names all of these (ask_ids)
+ASK = {"route": ("reseau-ask-route", "Ask Réseau: pick the semantic tool (HAR-104)", route_config)} | {
+    t: ("reseau-ask-" + t.replace("_", "-"), "Ask Réseau: answer from %s (HAR-104)" % t, partial(answer_config, t))
+    for t in ASK_TOOLS}
 
 
-def setup(g8, server_id):
-    """Create the voice agent and every workflow over a registered gateway -> (agent_id, {env var: action_id}).
+def ask_ids(value):
+    """RESEAU_ASK as setup prints it, "route=<action_id>,get_evidence=<action_id>,..." -> {key: action_id}."""
+    ids = dict(p.strip().split("=", 1) for p in (value or "").split(",") if "=" in p)
+    missing = [k for k in ASK if not ids.get(k)]
+    if missing:
+        raise WorkflowError("%s lacks %s: run `setup`" % (ASK_ENV, ", ".join(missing)))
+    return {k: ids[k] for k in ASK}
+
+
+def definitions(values):
+    """{env var: its value, as setup returns it} -> [(action_id, (name, description, config))], every workflow."""
+    found = [(a, WORKFLOWS[env]) for env, a in values.items() if env in WORKFLOWS]
+    if values.get(ASK_ENV):
+        ids = ask_ids(values[ASK_ENV])
+        found += [(ids[k], ASK[k]) for k in ASK]
+    return found
+
+
+def setup(g8, server_id, envs=ENVS, agent_id=None):
+    """Create the voice agent (unless agent_id reuses one) and the workflows behind each env var in envs, over a
+    registered gateway -> (agent_id, {env var: its value}); RESEAU_ASK's names its workflows (ask_ids).
     g8(method, path, body=None) -> (status, data): register_graph8.g8 bound to a client and key."""
-    _, agent = g8("POST", "/api/v1/voice/agents", AGENT)
-    agent_id = isinstance(agent, dict) and (agent.get("agent_id") or (agent.get("agent") or {}).get("agent_id"))
     if not agent_id:
-        raise WorkflowError("voice agent create failed: %s" % agent)
-    created = {}
-    for env, (name, description, config) in WORKFLOWS.items():
+        _, agent = g8("POST", "/api/v1/voice/agents", AGENT)
+        agent_id = isinstance(agent, dict) and (agent.get("agent_id") or (agent.get("agent") or {}).get("agent_id"))
+        if not agent_id:
+            raise WorkflowError("voice agent create failed: %s" % agent)
+    made = []
+
+    def create(name, description, config):
         _, wf = g8("POST", "/api/v1/workflows", {"name": name, "description": description,
                                                   "config": config(server_id, agent_id)})
         if not (isinstance(wf, dict) and wf.get("action_id")):
             raise WorkflowError("workflow %s create failed: %s (created: voice agent %s, workflows %s)"
-                                % (name, wf, agent_id, list(created.values())))
-        created[env] = wf["action_id"]
+                                % (name, wf, agent_id, made))
+        made.append(wf["action_id"])
+        return wf["action_id"]
+
+    created = {env: create(*WORKFLOWS[env]) for env in envs if env in WORKFLOWS}
+    if ASK_ENV in envs:
+        created[ASK_ENV] = ",".join("%s=%s" % (k, create(*d)) for k, d in ASK.items())
     return agent_id, created
 
 
@@ -240,9 +367,33 @@ def report_problems(report, summary):
             + verify.blockers(report, "blocked", summary["blocked"]))
 
 
+def declined(answer):
+    """The explicit decline: one uncited "No evidence found.", its period optional. verify.parse turns an empty
+    answer into NOTHING, which is one too."""
+    found = answer.get("answer") if isinstance(answer, dict) else None
+    return (isinstance(found, list) and len(found) == 1 and verify.is_sentence(found[0])
+            and not found[0]["activity_ids"]
+            and found[0]["text"].strip().rstrip(".").casefold() in ("no evidence found", "nothing to report"))
+
+
+def ask_problems(answer, output):
+    """An Ask Réseau answer's problems against the tool output it was written from. A decline is always allowed.
+    Otherwise every sentence cites activity_ids the tool returned, and every number it states is a count in the
+    output or part of a title there ("UI Critic Phase 3"). A get_business_context answer whose output links Graph8
+    records cites at least one of them, so "why does it matter" is answered with the customer, not the ticket."""
+    problems = [] if declined(answer) else (
+        verify.citations(answer, {"answer": output})
+        + verify.numbers(answer, "answer", verify.counted(output) | verify.titled(output)))
+    links = output.get("links")
+    if links and not any(i.startswith("graph8:") for _, s in verify.sentences(answer, "answer") for i in s["activity_ids"]):
+        problems.append("answer: cites none of the %d Graph8 record(s) get_business_context linked" % len(links))
+    return problems
+
+
 # tool node -> (the evidence attach() fills in from the tool output, the problems check)
 CHECKS = {"day_1": (lambda context: {"yesterday": context["yesterday"]["activity_ids"]}, briefing_problems),
-          "team_1": (lambda summary: {s: summary["total"][s]["activity_ids"] for s in COUNTED}, report_problems)}
+          "team_1": (lambda summary: {s: summary["total"][s]["activity_ids"] for s in COUNTED}, report_problems),
+          "ask_1": (lambda output: {}, ask_problems)}
 
 
 def checked(node, output, reply):
@@ -291,6 +442,66 @@ def daily_report(g8, action_id, day, attempts=2):
             "unmapped": summary["unmapped"], "incomplete": summary["incomplete"]}
 
 
+def directory(env=os.environ):
+    """What the route agent needs for arguments: today in the gateway's timezone, and the names of the people and
+    projects the gateway is configured with (RESEAU_IDENTITIES, RESEAU_PROJECTS). Names only, no identities."""
+    tz, path = semantic.load_tz(env), env.get(evidence.IDENTITIES_ENV)
+    return {"today": semantic.now().astimezone(tz).date().isoformat(), "timezone": str(tz),
+            "people": sorted(json.load(open(path))) if path else [],
+            "projects": sorted(semantic.load_projects(env, semantic.load_scope(env)))}
+
+
+def routed(reply):
+    """The route agent's reply -> ((tool, arguments), problems); tool None is its decline. Only one of ASK_TOOLS
+    with every argument a non-empty string is a route, and only those arguments are kept."""
+    parsed = verify.parse(reply)
+    if not isinstance(parsed, dict) or "tool" not in parsed:
+        return (None, {}), ["route: not a JSON object"]
+    tool, args = parsed["tool"], parsed.get("arguments")
+    if tool is None:
+        return (None, {}), []
+    if not isinstance(tool, str) or tool not in ASK_TOOLS:
+        return (None, {}), ["route: %r is not one of Ask Réseau's tools" % (tool,)]
+    args = args if isinstance(args, dict) else {}
+    params = list(ASK_TOOLS[tool].input_schema["properties"])
+    missing = [p for p in params if not (isinstance(args.get(p), str) and args[p].strip())]
+    if missing:
+        return (None, {}), ["route: %s needs %s" % (tool, ", ".join(missing))]
+    return (tool, {p: args[p] for p in params}), []
+
+
+def route_once(g8, action_id, message):
+    """One route execution -> (execution_id, None, agent reply, (tool, arguments), problems)."""
+    execution, nodes = execute(g8, action_id, {"message": message})
+    reply = (nodes.get("agent_1", {}).get("output") or {}).get("response")
+    return (execution, None, reply) + routed(reply)
+
+
+def answer_once(g8, action_id, question, arguments):
+    return run_once(g8, action_id, "ask_1", {"question": question, **arguments})
+
+
+def ask(g8, action_ids, question, env=os.environ, attempts=2):
+    """Ask Réseau, the dashboard's trigger. A Graph8 agent routes the question to one semantic tool, that tool's
+    answer workflow runs, and the verified answer comes back: {"question", "tool", "arguments", "execution_ids":
+    {"route", "answer"}, "sections": {"answer": [{"text", "activity_ids"}]}, "incomplete"}. action_ids is
+    ask_ids(RESEAU_ASK). A question no tool fits (tool None, no answer run) or whose tool output answers nothing is
+    the explicit decline, [{"text": "No evidence found.", "activity_ids": []}]. A route outside the semantic tools
+    or an answer that fails verification is retried; if every attempt fails, WorkflowError carries the problems."""
+    if not isinstance(question, str) or not question.strip():
+        raise WorkflowError("question is empty")
+    message = json.dumps({"question": question} | directory(env), ensure_ascii=False)
+    route, _, (tool, arguments) = verified(partial(route_once, g8, action_ids["route"], message), attempts)
+    out = {"question": question, "tool": tool, "arguments": arguments, "execution_ids": {"route": route},
+           "sections": {"answer": [{"text": DECLINE, "activity_ids": []}]}, "incomplete": []}
+    if tool is None:
+        return out
+    execution, output, answer = verified(partial(answer_once, g8, action_ids[tool], question, arguments), attempts)
+    return out | {"execution_ids": {"route": route, "answer": execution},
+                  "sections": out["sections"] if declined(answer) else answer,
+                  "incomplete": output.get("incomplete") or []}
+
+
 def verify_execution(g8, execution):
     """Any past run, e.g. one started from Graph8's dashboard, which shows the agent's raw reply: -> (sections,
     problems) through the same checks as the triggers. Free: it only reads the execution."""
@@ -305,22 +516,32 @@ def verify_execution(g8, execution):
     return checked(node, *outputs(execution, nodes, node))
 
 
-def update(g8, server_id, action_ids):
+def agent_of(g8, action_id):
+    """The voice agent an existing workflow's agent node runs."""
+    _, got = g8("GET", "/api/v1/workflows/" + action_id)
+    nodes = ((((got or {}).get("action") or {}).get("skill_config") or {}).get("nodes")) or []
+    agent_id = next((n["config"].get("agent_id") for n in nodes if n.get("node_type") == "agent"), None)
+    if not agent_id:
+        raise WorkflowError("workflow %s: no agent node found (HTTP body: %s)" % (action_id, str(got)[:300]))
+    return agent_id
+
+
+def configured(env=os.environ):
+    """{env var: its value} for every workflow env var that is set."""
+    return {e: env[e] for e in ENVS if env.get(e)}
+
+
+def update(g8, server_id, values):
     """Push this code's definitions and prompts, and the voice agent's persona, onto workflows setup() created,
-    {env var: action_id}, keeping their action_ids and voice agent -> agent_id. Graph8 stores the prompt in the
+    {env var: its value}, keeping their action_ids and voice agent -> agent_id. Graph8 stores the prompt in the
     workflow, so a prompt change reaches runs only through this."""
     agent_id = None
-    for env, action_id in action_ids.items():
-        _, got = g8("GET", "/api/v1/workflows/" + action_id)
-        nodes = ((((got or {}).get("action") or {}).get("skill_config") or {}).get("nodes")) or []
-        agent_id = next((n["config"].get("agent_id") for n in nodes if n.get("node_type") == "agent"), None)
-        if not agent_id:
-            raise WorkflowError("%s %s: no agent node found (HTTP body: %s)" % (env, action_id, str(got)[:300]))
-        name, description, config = WORKFLOWS[env]
+    for action_id, (name, description, config) in definitions(values):
+        agent_id = agent_of(g8, action_id)
         status, out = g8("PUT", "/api/v1/workflows/" + action_id, {"name": name, "description": description,
                                                                    "config": config(server_id, agent_id)})
         if status != 200:
-            raise WorkflowError("%s %s: update returned HTTP %s: %s" % (env, action_id, status, out))
+            raise WorkflowError("%s %s: update returned HTTP %s: %s" % (name, action_id, status, out))
     status, out = g8("PUT", "/api/v1/voice/agents/" + agent_id, AGENT)
     if status != 200:
         raise WorkflowError("voice agent %s: update returned HTTP %s: %s" % (agent_id, status, out))
@@ -340,28 +561,36 @@ def main(argv=sys.argv[1:]):
     from reseau import gateway, outbound, register_graph8
 
     if argv not in (["setup"], ["update"], ["start-my-day"]) and not (
-            len(argv) == 2 and argv[0] in ("daily-report", "verify")):
+            len(argv) == 2 and argv[0] in ("daily-report", "verify", "ask")):
         raise SystemExit(__doc__)
     key = gateway.resolve_credential(gateway.Upstream("graph8", register_graph8.BASE, "GRAPH8_API_KEY"))
     gateway.SECRETS.add(key)
     g8 = partial(register_graph8.g8, outbound.Client(), key)
-    if argv == ["setup"]:
-        agent_id, created = setup(g8, gateway_server_id(g8, register_graph8.NAME))
+    values = configured()
+    if argv == ["setup"]:  # only what isn't set up yet, on the voice agent the existing workflows use
+        envs = [e for e in ENVS if e not in values]
+        if not envs:
+            sys.exit("%s are all set: use `update`" % ", ".join(ENVS))
+        existing = definitions(values)
+        agent_id, created = setup(g8, gateway_server_id(g8, register_graph8.NAME), envs,
+                                  agent_of(g8, existing[0][0]) if existing else None)
         print("voice agent %s" % agent_id)
         print("\n".join("%s=%s" % kv for kv in created.items()))
         return 0
     if argv == ["update"]:
-        action_ids = {env: os.environ[env] for env in WORKFLOWS if os.environ.get(env)}
-        if not action_ids:
-            sys.exit("none of %s is set: run `setup` first" % ", ".join(WORKFLOWS))
-        agent_id = update(g8, gateway_server_id(g8, register_graph8.NAME), action_ids)
-        print("updated %s and voice agent %s" % (", ".join(action_ids), agent_id))
+        if not values:
+            sys.exit("none of %s is set: run `setup` first" % ", ".join(ENVS))
+        agent_id = update(g8, gateway_server_id(g8, register_graph8.NAME), values)
+        print("updated %s and voice agent %s" % (", ".join(values), agent_id))
         return 0
     if argv[0] == "verify":
         sections, problems = verify_execution(g8, argv[1])
         print(json.dumps({"sections": sections, "problems": problems}, indent=2, ensure_ascii=False))
         print("VERIFIED" if not problems else "FAILED: %d problem(s)" % len(problems))
         return 1 if problems else 0
+    if argv[0] == "ask":
+        print(json.dumps(ask(g8, ask_ids(values.get(ASK_ENV)), argv[1]), indent=2, ensure_ascii=False))
+        return 0
     env = START_MY_DAY_ENV if argv[0] == "start-my-day" else REPORT_ENV
     action_id = os.environ.get(env) or sys.exit("%s is not set: run `setup` first" % env)
     out = start_my_day(g8, action_id) if argv[0] == "start-my-day" else daily_report(g8, action_id, argv[1])

@@ -95,6 +95,14 @@ def counted(value):
     return {value} if isinstance(value, int) and not isinstance(value, bool) else set()
 
 
+def titled(value):
+    """Every number in a title or name in a tool's JSON output: "UI Critic Phase 3" names a 3, it doesn't count one."""
+    if isinstance(value, dict):
+        return {n for k, v in value.items()
+                for n in (stated(v) if k in ("title", "name") and isinstance(v, str) else titled(v))}
+    return {n for v in value for n in titled(v)} if isinstance(value, list) else set()
+
+
 def numbers(reply, section, allowed):
     """Every number a section's sentences state is one of allowed (counted(tool output)): a summary may say
     "8 issues" only if the tool returned a count of 8."""

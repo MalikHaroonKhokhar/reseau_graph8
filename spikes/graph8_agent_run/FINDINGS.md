@@ -81,3 +81,14 @@ Fix, which also keeps the prompt small: a `run_javascript` node between the tool
 **Demo run, green end to end** (`action_id 39682a7e-3e95-4c86-a399-14597316d7ec`, 25.8 s, all nodes `completed`): `trigger → github_list_pull_requests → linear_list_issues → merge_1 → agent_1`, every tool call routed through the registered `reseau-gateway`. The agent returned: *"PR #14 landed a README wording fix … HAR-90 … is done; HAR-99 … is still open."* — correct PR number, correct issue ids, correct statuses, and no persona greeting (the voice agent `73e0c4a9-…` is created with `conciseness_level 0.9` and an explicit "no greetings, no sign-offs" persona).
 
 **Tunnel caveat:** free `localhost.run` tunnels drop without warning. When that happened mid-run, `gh_1` failed in 1.9 s with the usual `TaskGroup` message while the public URL returned 503. Recovery is `PUT /api/v1/voice/mcp-servers/{id}` with the new `connection_url` — the `mcp_server_id` is unchanged, so existing workflows keep working.
+
+## Addendum (2026-09-27, HAR-104): a tool node's `mcp_tool_name` is not interpolated
+
+Free probe over the registered `reseau-gateway` (tool and `run_javascript` nodes only, workflows deleted after):
+`mcp_tool_name: "${trigger.tool}"` and `"${pick_1.result.tool}"` both failed with the usual `TaskGroup` error,
+while the same workflow with `"get_team_summary"` written out returned the team summary. So a workflow can't
+pick its MCP tool at run time, although the node-types schema says `${...}` works "inside any string config
+field". A tool whose arguments came from nested refs (`${pick_1.result.date}`) was still `running` after 120 s.
+Both condition shapes tried (`conditions` + `true_node_id`, and `paths`) pass `/validate`; neither was run.
+Ask Réseau therefore routes with an agent in its own workflow, and each tool has its own answer workflow
+(`reseau/workflows.py`).

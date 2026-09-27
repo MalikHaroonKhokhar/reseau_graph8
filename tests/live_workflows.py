@@ -75,7 +75,7 @@ def drive(public_url, token, runs, chosen, w):
             return False
         _, tested = g8("POST", "/api/v1/voice/mcp-servers/%s/test" % server)
         say("/test:", tested)
-        agent_id, created = workflows.setup(g8, server)
+        agent_id, created = workflows.setup(g8, server, [env for env, _ in ONCE.values()])
         say("voice agent", agent_id, "workflows", created)
         for name, _, config in workflows.WORKFLOWS.values():
             say("validate %s:" % name, g8("POST", "/api/v1/workflows/validate", {"config": config(server, agent_id)})[1])
