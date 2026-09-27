@@ -86,11 +86,15 @@ def follow(g8, token, lines, tries=TRIES, pause=10):
 def main(argv=sys.argv[1:]):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--port", type=int, default=8080, help="the local gateway's port")
+    p.add_argument("--url", help="a fixed public gateway host (e.g. Render's): point the registration at it once, "
+                                 "no tunnel")
     a = p.parse_args(argv)
     key = gateway.resolve_credential(gateway.Upstream("graph8", register_graph8.BASE, "GRAPH8_API_KEY"))
     token = front.load_tokens(os.environ)[0]
     gateway.SECRETS.update({key, token})
     g8 = partial(register_graph8.g8, outbound.Client(), key)
+    if a.url:
+        return 0 if point(g8, "%s/g8/%s/sse" % (a.url.rstrip("/"), token)) else 1
     while True:
         proc = subprocess.Popen(ssh(a.port), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace")
