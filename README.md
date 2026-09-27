@@ -65,6 +65,9 @@ then deletes the record and verifies that it's gone.
   returns `connection_url` in plaintext, so anyone with an org key can read the token. The token only
   unlocks the gateway's read-only, allowlisted tools. Rotate it when a registration is removed:
   put the new token first in `RESEAU_GATEWAY_TOKEN`, re-register, then drop the old one.
+  This is an accepted exception: HAR-96's criterion reads "no *upstream* credentials in Graph8 read
+  responses". Graph8 returns every registration field, so no registration can hide a secret today. The
+  proposed Graph8 fix is in `upstream/graph8_mcp_read_redaction/`.
 - **Tokens stay out of logs and output.** Every upstream token and gateway token is redacted from all log
   records, tool results and errors, and uvicorn's access log is off.
 
@@ -85,4 +88,4 @@ The tests run against local mock MCP servers on loopback and need no network.
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |
-| `upstream/` | Fixes proposed to Graph8, to be handed off as tickets |
+| `upstream/` | Fixes proposed to Graph8, handed off as tickets (tests: `uv run pytest upstream/<name>`) |
