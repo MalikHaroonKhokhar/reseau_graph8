@@ -26,6 +26,13 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   `github:commit:owner/repo@<sha>`, `github:review_comment:owner/repo#9/<comment id>`,
   `github:review:owner/repo#9/<review id>` or `linear:issue:ENG-142` to a normalized record: canonical URL,
   actor, timestamps and `fetched_at`. A commit ID carries its repo because GitHub can't look up a bare SHA.
+- **Graph8 business records are evidence too.** `graph8:customer:<company id>`, `graph8:opportunity:<deal id>`,
+  `graph8:commitment:<task id>` and `graph8:conversation:meeting/<id>` or `graph8:conversation:<channel>/<thread id>`
+  resolve to the same record shape, with the owner (deal owner, task assignee) as the actor. Graph8 has no record
+  URL, so `url` is `null` and the activity_id is the citation. A commitment is a Graph8 task linked to a deal or
+  company; any other task is `not_found`. Known gaps: account correspondence has no MCP tool (REST only) and isn't
+  covered; meeting and inbox-thread shapes come from Graph8's output schemas, since the org had none to read
+  (`spikes/graph8_entities/FINDINGS.md`).
 - **Fewer, smarter tools.** `get_person_activity(person, date)` returns one person's commits, PRs opened and
   merged, reviews, and Linear issues moved or completed on a day. `get_my_day_context()` returns the caller's
   `focus` (highest-priority open Linear issues, with the open PRs they wait on), `needs_attention`
@@ -59,7 +66,7 @@ cp .env.example .env   # then fill it in
 | `GITHUB_MCP_TOKEN` | GitHub PAT (read scopes are enough) |
 | `LINEAR_API_KEY` | Linear API key (`lin_api_…`) |
 | `GRAPH8_API_KEY` | Graph8 org API key (`g8_live_…`). Used as an upstream and by the registration script. |
-| `RESEAU_IDENTITIES` | Optional. Path to a JSON map of people to their upstream IDs, e.g. `{"ana": {"github": "ana-gh", "linear": "<Linear user id>"}}`. Actors not in the map are reported as `unmapped`, never guessed. `get_person_activity` only accepts people in this map. |
+| `RESEAU_IDENTITIES` | Optional. Path to a JSON map of people to their upstream IDs, e.g. `{"ana": {"github": "ana-gh", "linear": "<Linear user id>", "graph8": "<Graph8 user id>"}}`. Actors not in the map are reported as `unmapped`, never guessed. `get_person_activity` only accepts people in this map. |
 | `RESEAU_GITHUB_SCOPE` | Comma-separated GitHub owners (users or orgs) and `owner/repo` entries: everything the gateway may read on GitHub, e.g. `ana-gh,acme/app`. An owner entry covers only repos that account owns, not the orgs it belongs to. Unset means no GitHub repo is read. |
 | `RESEAU_PROJECTS` | Optional. Path to a JSON map of projects to their Linear project and GitHub repos, e.g. `{"app": {"linear": "App launch", "repos": ["acme/app"]}}`. Every repo must be inside `RESEAU_GITHUB_SCOPE`. `get_project_context` only accepts projects in this map. |
 | `RESEAU_TEAM` | Optional. The Linear team (name, key or ID) that `get_team_summary` covers. Members not in `RESEAU_IDENTITIES` are listed as unmapped and not counted. |
@@ -119,7 +126,7 @@ The tests run against local mock MCP servers on loopback and need no network.
 |---|---|
 | `reseau/gateway.py` | Upstream side: credentials, sessions, retries, tool prefixing, allowlists, redaction |
 | `reseau/front.py` | Graph8-facing side: legacy SSE server and token auth |
-| `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source |
+| `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source (GitHub, Linear, Graph8) |
 | `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context` and `get_team_summary`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues and team membership are resolved. |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
 | `reseau/register_graph8.py` | Graph8 registration live check |

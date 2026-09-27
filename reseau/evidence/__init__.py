@@ -1,13 +1,14 @@
 """Normalized work model with provenance (HAR-98): activity_ids, identity mapping, get_evidence.
 
 activity_id = "<source>:<kind>:<key>", e.g. github:pr:o/r#9, github:commit:o/r@<sha>,
-github:review_comment:o/r#9/<comment id>, github:review:o/r#9/<review id>, linear:issue:ENG-142.
-A commit carries its repo because get_commit can't resolve a bare SHA. A new source (graph8, HAR-108) is
-one more module in SOURCES.
+github:review_comment:o/r#9/<comment id>, github:review:o/r#9/<review id>, linear:issue:ENG-142,
+graph8:customer:<id>, graph8:opportunity:<uuid>, graph8:commitment:<uuid>, graph8:conversation:<channel>/<id>
+(graph8.py). A commit carries its repo because get_commit can't resolve a bare SHA. A new source is one more
+module in SOURCES.
 
 Identities come only from an explicit map (RESEAU_IDENTITIES = path to JSON:
-{"<person>": {"github": "<login>", "linear": "<Linear user id>"}}). No match -> identity "unmapped";
-nothing is inferred from names or emails (Linear's MCP exposes no email to match on).
+{"<person>": {"github": "<login>", "linear": "<Linear user id>", "graph8": "<Graph8 user id>"}}). No match ->
+identity "unmapped"; nothing is inferred from names or emails (Linear's MCP exposes no email to match on).
 """
 import dataclasses
 import json
@@ -18,9 +19,9 @@ from datetime import datetime, timezone
 import mcp.types as types
 from mcp.shared.exceptions import MCPError
 
-from reseau.evidence import github, linear
+from reseau.evidence import github, graph8, linear
 
-SOURCES = {"github": github.KINDS, "linear": linear.KINDS}
+SOURCES = {"github": github.KINDS, "linear": linear.KINDS, "graph8": graph8.KINDS}
 IDENTITIES_ENV = "RESEAU_IDENTITIES"
 MAX_PAGES = 10  # review comments are found by paging; past 10 x 100 threads the search reports search_incomplete
 
@@ -29,15 +30,18 @@ INVALID_ACTIVITY_ID = -32602  # JSON-RPC "invalid params"
 EVIDENCE_NOT_FOUND = -32008
 EVIDENCE_UPSTREAM_ERROR = -32009
 EVIDENCE_SEARCH_INCOMPLETE = -32010
-# The phrases the live upstreams use for a missing object (captured in this ticket's probes).
-UPSTREAM_NOT_FOUND = re.compile(r"404 Not Found|No commit found|Could not resolve to a|Could not find referenced")
+# The phrases the live upstreams use for a missing object (captured in HAR-98's and HAR-108's probes). Graph8:
+# "Deal not found", "Task <id>: Error: Task lookup: Task not found", "Email <id> not found", "Invalid meeting ID".
+UPSTREAM_NOT_FOUND = re.compile(r"404 Not Found|No commit found|Could not resolve to a|Could not find referenced"
+                                r"|(?:Company|Deal|Task) not found|Inbox thread: .* not found|Invalid meeting ID")
 
 TOOL = types.Tool(
     name="get_evidence",
     description="Resolve an activity_id (e.g. github:pr:owner/repo#9, github:commit:owner/repo@<sha>, "
                 "github:review_comment:owner/repo#9/<comment id>, github:review:owner/repo#9/<review id>, "
-                "linear:issue:ENG-142) to its source record: "
-                "canonical URL, actor (with Réseau person, or identity 'unmapped'), timestamps and fetched_at.",
+                "linear:issue:ENG-142, graph8:customer:<id>, graph8:opportunity:<id>, graph8:commitment:<id>, "
+                "graph8:conversation:<channel>/<id>) to its source record: canonical URL (null for Graph8, which "
+                "has none), actor or owner (with Réseau person, or identity 'unmapped'), timestamps and fetched_at.",
     input_schema={"type": "object", "properties": {"activity_id": {"type": "string"}}, "required": ["activity_id"]},
 )
 
@@ -107,10 +111,11 @@ async def get_evidence(call_tool, activity_id, index, now=None):
     """Fetch and normalize one record. call_tool = Gateway.call_tool (allowlist and redaction apply)."""
     source, kind_name, fields = parse(activity_id)
     kind = SOURCES[source][kind_name]
+    tool = kind.tool(fields) if callable(kind.tool) else kind.tool
     fetched_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     args = kind.args(fields)
     for _ in range(MAX_PAGES):
-        payload = await fetch_json(call_tool, source, kind.tool, args, activity_id)
+        payload = await fetch_json(call_tool, source, tool, args, activity_id)
         if payload is None:
             break
         record = kind.normalize(payload, fields, fetched_at)

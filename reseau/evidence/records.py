@@ -1,4 +1,5 @@
-"""Shared record types for normalized upstream work objects. Providers (github.py, linear.py) build these."""
+"""Shared record types for normalized upstream work objects. Providers (github.py, linear.py, graph8.py) build
+these."""
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -19,7 +20,7 @@ class Record:
     source: str
     kind: str
     source_id: str
-    url: str
+    url: str | None  # canonical link; None when the source has none (Graph8: cite the activity_id)
     title: str
     actor: Actor
     created_at: str | None
@@ -30,12 +31,12 @@ class Record:
 @dataclass(frozen=True)
 class Kind:
     """One record kind of a source. `pattern` parses the activity_id key into fields, `template` formats it
-    back. `args` maps fields to `tool`'s arguments; `normalize(payload, fields, fetched_at)` returns a
-    Record, or None when this payload doesn't hold it; `next_page(payload, args)` gives the next page's
-    args, or None, for kinds found by paging."""
+    back. `tool` is the tool name, or fields -> name when the key picks the tool. `args` maps fields to the
+    tool's arguments; `normalize(payload, fields, fetched_at)` returns a Record, or None when this payload
+    doesn't hold it; `next_page(payload, args)` gives the next page's args, or None, for kinds found by paging."""
     pattern: str
     template: str
-    tool: str
+    tool: str | Callable[[dict], str]
     args: Callable[[dict], dict]
     normalize: Callable[[dict, dict, str], "Record | None"]
     next_page: Callable[[dict, dict], dict | None] | None = None

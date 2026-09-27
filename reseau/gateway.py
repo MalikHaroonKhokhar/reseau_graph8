@@ -25,6 +25,7 @@ returned, and install_log_redaction() (run by Gateway) scrubs every log record i
 import json
 import logging
 import os
+import re
 from contextlib import AsyncExitStack, nullcontext
 from dataclasses import dataclass
 
@@ -83,6 +84,9 @@ class Upstream:
     # Every tool this upstream serves is read-only (e.g. a /readonly endpoint), so a tools/call refused with 429
     # may be retried.
     read_only: bool = False
+    # Regex (re.match) for a text result that reports a tool failure with isError unset: marked isError here, so
+    # clients and get_evidence see it as the failure it is. Graph8 answers "Error: Deal: Deal not found" (HAR-107).
+    error_text: str | None = None
 
 
 # Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
@@ -91,6 +95,9 @@ class Upstream:
 # repo_scoped check covers them all; keep it that way. Search takes a free-text query instead, so it is
 # internal: the semantic tools add the scope's qualifiers to every query, and no client can call it. Linear's
 # list_users is internal too: the team roster needs it, but it returns every workspace member's email.
+# Graph8's endpoint serves writes too, so its allowlist is the guard: only the read-only (readOnlyHint) tools
+# HAR-107 maps to customers, deals, conversations and tasks (spikes/graph8_entities/FINDINGS.md), for HAR-108 and
+# HAR-109. g8_crm_get_company, the one get-by-ID for a company, is hidden from tools/list; get_evidence calls it.
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
@@ -101,10 +108,13 @@ DEFAULT_UPSTREAMS = (
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
                               "get_project"}),
              internal=frozenset({"list_users"}), read_only=True),
-    # ponytail: Graph8 has no known read-only endpoint; the allowlist alone keeps its 126 tools out.
     Upstream("graph8", "https://be.graph8.com/mcp/", "GRAPH8_API_KEY", "g8_current_org", GRAPH8_ORG_GATE,
              prefix="",  # Graph8 already names its tools g8_*
-             allow=frozenset({"g8_current_org"})),
+             allow=frozenset({"g8_current_org", "g8_search_companies", "g8_get_contact_company", "g8_get_deals",
+                              "g8_get_deal", "g8_get_company_deals", "g8_get_contact_deals", "g8_get_tasks",
+                              "g8_get_task", "g8_list_inbox", "g8_get_reply", "g8_list_meetings", "g8_get_meeting",
+                              "g8_list_notes"}),
+             internal=frozenset({"g8_crm_get_company"}), error_text=r"[^{\[\n]*\bError: "),
 )
 
 
@@ -534,7 +544,11 @@ class Gateway:
             raise UpstreamError(CONTEXT_NOT_ESTABLISHED, "%s: context still not established after %s; not retrying"
                                 % (name, up.bootstrap_tool), name, "context_not_established")
 
-        return scrub_model(await self._use(name, op), self.secrets)
+        result = scrub_model(await self._use(name, op), self.secrets)
+        if up.error_text and not result.is_error and re.match(
+                up.error_text, "".join(c.text for c in result.content if c.type == "text")):
+            result = result.model_copy(update={"is_error": True})
+        return result
 
     async def tools(self):
         """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream

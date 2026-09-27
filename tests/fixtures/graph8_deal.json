@@ -1,0 +1,31 @@
+{
+  "id": "5f1c2b7e-8a44-4c1e-9d0b-2e6f3a9c7d10",
+  "name": "Example Customer Co - annual plan",
+  "amount": 12000,
+  "currency": "USD",
+  "close_date": "2026-10-31",
+  "closed_lost_reason": null,
+  "company_id": 4242,
+  "contact_count": 1,
+  "contact_id": 9001,
+  "contacts": null,
+  "created_at": "2026-09-21T10:00:00Z",
+  "last_activity_at": null,
+  "owner_email": "owner@example.com",
+  "owner_id": "7c3a9e51-2d84-4b6f-a0e3-91f5d2c8b476",
+  "owner_name": "Sam Owner",
+  "pipeline_id": "b1d2c3e4-0000-4000-8000-000000000001",
+  "primary_contact": {
+    "email": "buyer@example.com",
+    "id": 9001,
+    "name": "Pat Buyer",
+    "role": null,
+    "title": null
+  },
+  "stage_id": "b1d2c3e4-0000-4000-8000-000000000002",
+  "stage_name": "Proposal",
+  "status": null,
+  "updated_at": "2026-09-25T16:30:00Z",
+  "description": "Needs SSO before signing.",
+  "revision": 3
+}
