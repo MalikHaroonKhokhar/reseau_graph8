@@ -1,0 +1,15 @@
+# commit d299d57, 2026-09-27T01:58:38Z
+# python -m reseau.register_graph8 https://0fb34a13955786.lhr.life
+gateway exposes 14 tools at https://0fb34a13955786.lhr.life/g8/[REDACTED]/sse
+  POST /api/v1/voice/mcp-servers -> 201
+  GET /api/v1/workflows/mcp-servers -> 200
+read route echoes the token: True (treat RESEAU_GATEWAY_TOKEN as exposed org-wide)
+  POST /api/v1/voice/mcp-servers/4ed68a3c-a030-4954-bd58-4edf7cd3c5f9/test -> 200
+/test: {'success': True, 'message': 'Connection successful', 'tools_count': 14}
+PASS - tools_count 14, expected 14
+  DELETE /api/v1/voice/mcp-servers/4ed68a3c-a030-4954-bd58-4edf7cd3c5f9 -> 200
+  GET /api/v1/workflows/mcp-servers -> 200
+deleted: True final list: {'servers': 0, 'total': 0}
+# exit=0
+# gateway log lines containing RESEAU_GATEWAY_TOKEN: 0
+# gateway log lines containing an upstream token: 0
