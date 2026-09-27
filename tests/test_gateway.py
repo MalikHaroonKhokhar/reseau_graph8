@@ -493,7 +493,7 @@ def test_merged_surface_routes_each_name_to_its_upstream(mocks):
             return names, out, e.value
 
     names, out, err = run(go())
-    assert len(names) == len(set(names)) == 15  # 7 per upstream + get_evidence
+    assert len(names) == len(set(names)) == 17  # 7 per upstream + get_evidence and the 2 semantic tools
     # the mocks only know raw names, so each answer proves the raw name went upstream unchanged
     assert out == {"github_list_issues": "list_issues@mock-stateful", "linear_list_issues": "list_issues@mock-stateless",
                    "github_list_releases": "list_releases@mock-stateful",
@@ -531,7 +531,7 @@ def test_collision_fails_startup_and_closes_connections(mocks):
 
 def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
     _, lin = mocks
-    up = Upstream("linear", lin.url, "LINEAR_API_KEY", allow=frozenset({"list_issues"}))
+    up = Upstream("linear", lin.url, "LINEAR_API_KEY", allow=frozenset({"list_issues"}), internal=frozenset({"echo"}))
 
     async def go():
         async with Gateway([up], {"LINEAR_API_KEY": LIN_TOKEN}) as gw:
@@ -540,13 +540,18 @@ def test_red_allowlist_hides_and_blocks_tool_before_upstream(mocks):
                 await gw.call_tool("linear", "create_issue", {"title": "x"})
             with pytest.raises(UpstreamError) as exposed:
                 await gw.call("linear_create_issue", {"title": "x"})
+            with pytest.raises(UpstreamError) as internal_by_client:
+                await gw.call("linear_echo", {"text": "x"})
+            internal = (await gw.call_tool("linear", "echo", {"text": "x"})).content[0].text
             ok = (await gw.call("linear_list_issues")).content[0].text
-            return names, raw.value, exposed.value, ok, gw.health()
+            return names, raw.value, exposed.value, internal_by_client.value, internal, ok, gw.health()
 
-    names, raw, exposed, ok, health = run(go())
-    assert names == ["linear_list_issues", "get_evidence"]
+    names, raw, exposed, internal_by_client, internal, ok, health = run(go())
+    assert names == ["linear_list_issues", "get_evidence", "get_person_activity", "get_my_day_context"]
     assert (raw.code, raw.data["kind"]) == (-32007, "tool_not_allowed")
     assert exposed.data["kind"] == "unknown_tool"
+    # an internal tool is callable by Réseau's own tools only: not listed, not routed for a client
+    assert (internal_by_client.data["kind"], internal) == ("unknown_tool", "echo:x")
     assert ok == "list_issues@mock-stateless"
     assert lin.created == 0  # the blocked call never reached the upstream
     assert health["linear"]["ok"]  # a blocked call is not an upstream failure
@@ -557,4 +562,6 @@ def test_default_config_is_read_only_and_allowlisted():
     ups = {u.name: u for u in DEFAULT_UPSTREAMS}
     assert ups["github"].url.endswith("/mcp/readonly") and ups["linear"].url.endswith("/mcp/readonly")
     assert all(u.allow is not None for u in DEFAULT_UPSTREAMS)
+    assert not ups["github"].allow & {"search_pull_requests", "search_repositories", "list_branches"}
+    assert ups["github"].repo_scoped and not ups["linear"].repo_scoped
     assert ups["graph8"].bootstrap_tool in ups["graph8"].allow

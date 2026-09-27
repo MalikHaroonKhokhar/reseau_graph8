@@ -1,0 +1,32 @@
+[
+  {
+    "id": 4779067900,
+    "state": "COMMENTED",
+    "body": "Mutable default argument in flatten(); prefer None and create the list inside.\n\n(body trimmed)",
+    "html_url": "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-4779067900",
+    "user": {
+      "login": "octo-dev",
+      "id": 1000001,
+      "profile_url": "https://github.com/octo-dev",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1000001?v=4"
+    },
+    "commit_id": "5364487a0ecd2d3e71ee361be00fbee693636c01",
+    "submitted_at": "2026-07-25T09:49:14Z",
+    "author_association": "OWNER"
+  },
+  {
+    "id": 4779069846,
+    "state": "COMMENTED",
+    "body": "The changes in expense.py replace the typing import.\n\n(body trimmed)",
+    "html_url": "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-4779069846",
+    "user": {
+      "login": "octo-dev",
+      "id": 1000001,
+      "profile_url": "https://github.com/octo-dev",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1000001?v=4"
+    },
+    "commit_id": "5364487a0ecd2d3e71ee361be00fbee693636c01",
+    "submitted_at": "2026-07-25T09:51:20Z",
+    "author_association": "OWNER"
+  }
+]

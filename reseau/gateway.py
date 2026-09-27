@@ -27,7 +27,7 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-from reseau import evidence, outbound
+from reseau import evidence, outbound, semantic
 
 log = logging.getLogger("reseau.gateway")
 
@@ -43,7 +43,9 @@ UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
+OUT_OF_SCOPE = -32012  # after reseau/evidence's and reseau/semantic's codes
 # -32008, -32009, -32010: reseau/evidence (not found, upstream error, search incomplete)
+# -32011: reseau/semantic (unmapped person)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
 # Upstream-sent, so it shares the number with UPSTREAM_UNAVAILABLE but never meets it: only matched inside call_tool.
 GRAPH8_ORG_GATE = -32003
@@ -64,14 +66,25 @@ class Upstream:
     # Raw tool names this upstream may list and call; None = pass everything through. A blocked call is
     # rejected before it reaches the upstream. The bootstrap tool is called internally either way.
     allow: frozenset[str] | None = None
+    # Raw tool names only Réseau's own tools may call (Gateway.call_tool): never listed, never routed for a
+    # client. For tools that would widen what a client can reach, e.g. GitHub search across every repo.
+    internal: frozenset[str] = frozenset()
+    # A call carrying owner/repo arguments must be inside RESEAU_GITHUB_SCOPE, whoever makes it: a client,
+    # get_evidence or the semantic tools. Checked before the upstream is called.
+    repo_scoped: bool = False
 
 
 # Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
 # plus a minimal allowlist for the semantic tools (HAR-100, HAR-101, HAR-109); grow it from those tickets.
+# GitHub reads are limited to RESEAU_GITHUB_SCOPE. Every allowlisted tool but get_me takes owner/repo, so the
+# repo_scoped check covers them all; keep it that way. Search takes a free-text query instead, so it is
+# internal: the semantic tools add the scope's qualifiers to every query, and no client can call it.
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
-                              "list_issues", "issue_read"})),
+                              "list_issues", "issue_read"}),
+             internal=frozenset({"search_pull_requests", "search_repositories", "list_branches"}),
+             repo_scoped=True),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
                               "get_project"})),
@@ -319,6 +332,8 @@ class Gateway:
     def __init__(self, upstreams=DEFAULT_UPSTREAMS, env=os.environ, identities=None):
         self.env = env
         self.identities = evidence.load_identities(env) if identities is None else evidence.identity_index(identities)
+        self.tz = semantic.load_tz(env)
+        self.github_scope = semantic.load_scope(env)
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
@@ -433,9 +448,14 @@ class Gateway:
     async def call_tool(self, name, tool, arguments=None):
         c = self._conn(name)
         up = c.upstream
-        if not allowed(up, tool):
+        if not allowed(up, tool) and tool not in up.internal:
             raise UpstreamError(TOOL_NOT_ALLOWED, "%s: tool %r is not allowlisted" % (name, tool), name, "tool_not_allowed")
         args = arguments or {}
+        if up.repo_scoped and "owner" in args and not semantic.in_scope(self.github_scope, args["owner"],
+                                                                        args.get("repo")):
+            raise UpstreamError(OUT_OF_SCOPE, "%s: %s%s is outside %s" % (
+                name, args["owner"], "/%s" % args["repo"] if "repo" in args else "", semantic.SCOPE_ENV),
+                name, "out_of_scope")
 
         async def establish(client, stale_gen):
             """Bootstrap unless another caller already did since stale_gen: concurrent callers share one call."""
@@ -469,7 +489,7 @@ class Gateway:
     async def tools(self):
         """The merged tools/list: every reachable upstream's tools under their exposed names. A down upstream
         is left out (health() says why), and so is one that answers tools/list with its own error: one bad
-        upstream never takes down the surface or startup. Réseau's own get_evidence comes last.
+        upstream never takes down the surface or startup. Réseau's own tools come last.
         Raises ValueError on a name collision."""
         listed = []
         for c in self.conns.values():
@@ -479,10 +499,11 @@ class Gateway:
                 if not isinstance(exc, UpstreamError):
                     log.warning("upstream %s tools/list failed: %s", c.upstream.name, exc.message)
         tools, self.routes = merge_tools(listed)
-        if evidence.TOOL.name in self.routes:
-            raise ValueError("tool name collision: %r from %s/%s and reseau"
-                             % (evidence.TOOL.name, *self.routes[evidence.TOOL.name]))
-        return tools + [evidence.TOOL]
+        own = [evidence.TOOL, *semantic.TOOLS]
+        for t in own:
+            if t.name in self.routes:
+                raise ValueError("tool name collision: %r from %s/%s and reseau" % (t.name, *self.routes[t.name]))
+        return tools + own
 
     async def call(self, name, arguments=None):
         """tools/call by exposed name: route to the owning upstream with the raw name. An unknown name
@@ -490,6 +511,8 @@ class Gateway:
         if name == evidence.TOOL.name:
             return evidence.as_result(await evidence.get_evidence(
                 self.call_tool, (arguments or {}).get("activity_id"), self.identities))
+        if name in semantic.HANDLERS:
+            return evidence.as_result(await semantic.HANDLERS[name](self, arguments or {}))
         if name not in self.routes:
             await self.tools()  # ponytail: every unknown name re-lists all upstreams; rate-limit if clients spam typos
         if name not in self.routes:

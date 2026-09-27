@@ -1,8 +1,9 @@
 """Normalized work model with provenance (HAR-98): activity_ids, identity mapping, get_evidence.
 
 activity_id = "<source>:<kind>:<key>", e.g. github:pr:o/r#9, github:commit:o/r@<sha>,
-github:review_comment:o/r#9/<comment id>, linear:issue:ENG-142. A commit carries its repo because
-get_commit can't resolve a bare SHA. A new source (graph8, HAR-108) is one more module in SOURCES.
+github:review_comment:o/r#9/<comment id>, github:review:o/r#9/<review id>, linear:issue:ENG-142.
+A commit carries its repo because get_commit can't resolve a bare SHA. A new source (graph8, HAR-108) is
+one more module in SOURCES.
 
 Identities come only from an explicit map (RESEAU_IDENTITIES = path to JSON:
 {"<person>": {"github": "<login>", "linear": "<Linear user id>"}}). No match -> identity "unmapped";
@@ -34,7 +35,8 @@ UPSTREAM_NOT_FOUND = re.compile(r"404 Not Found|No commit found|Could not resolv
 TOOL = types.Tool(
     name="get_evidence",
     description="Resolve an activity_id (e.g. github:pr:owner/repo#9, github:commit:owner/repo@<sha>, "
-                "github:review_comment:owner/repo#9/<comment id>, linear:issue:ENG-142) to its source record: "
+                "github:review_comment:owner/repo#9/<comment id>, github:review:owner/repo#9/<review id>, "
+                "linear:issue:ENG-142) to its source record: "
                 "canonical URL, actor (with Réseau person, or identity 'unmapped'), timestamps and fetched_at.",
     input_schema={"type": "object", "properties": {"activity_id": {"type": "string"}}, "required": ["activity_id"]},
 )
@@ -76,12 +78,29 @@ def identity_index(people):
     return index
 
 
-def resolve(record, index):
-    a = record.actor
+def resolve_actor(a, index):
     person = a.id and index.get((a.source, a.id.casefold()))
-    if not person:
-        return record
-    return dataclasses.replace(record, actor=dataclasses.replace(a, person=person, identity="mapped"))
+    return dataclasses.replace(a, person=person, identity="mapped") if person else a
+
+
+def resolve(record, index):
+    return dataclasses.replace(record, actor=resolve_actor(record.actor, index))
+
+
+async def fetch_json(call_tool, source, tool, args, activity_id=None):
+    """One upstream tool call -> its JSON payload, or None when the upstream says the object doesn't exist.
+    Any other failure raises upstream_error."""
+    result = await call_tool(source, tool, args)
+    text = "".join(c.text for c in result.content if c.type == "text")
+    if result.is_error:
+        if UPSTREAM_NOT_FOUND.search(text):
+            return None
+        raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s" % (source, text[:500]), activity_id)
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s returned non-JSON" % (source, tool),
+                     activity_id) from None
 
 
 async def get_evidence(call_tool, activity_id, index, now=None):
@@ -91,17 +110,9 @@ async def get_evidence(call_tool, activity_id, index, now=None):
     fetched_at = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
     args = kind.args(fields)
     for _ in range(MAX_PAGES):
-        result = await call_tool(source, kind.tool, args)
-        text = "".join(c.text for c in result.content if c.type == "text")
-        if result.is_error:
-            if UPSTREAM_NOT_FOUND.search(text):
-                break
-            raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s" % (source, text[:500]), activity_id)
-        try:
-            payload = json.loads(text)
-        except ValueError:
-            raise _error(EVIDENCE_UPSTREAM_ERROR, "upstream_error", "%s: %s returned non-JSON" % (source, kind.tool),
-                         activity_id) from None
+        payload = await fetch_json(call_tool, source, kind.tool, args, activity_id)
+        if payload is None:
+            break
         record = kind.normalize(payload, fields, fetched_at)
         if record:
             return resolve(record, index)
@@ -114,6 +125,7 @@ async def get_evidence(call_tool, activity_id, index, now=None):
     raise _error(EVIDENCE_NOT_FOUND, "not_found", "no evidence found for %s" % activity_id, activity_id)
 
 
-def as_result(record):
-    data = dataclasses.asdict(record)
+def as_result(obj):
+    """Any result dataclass -> tool result, as JSON text and as structured content."""
+    data = dataclasses.asdict(obj)
     return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(data))], structured_content=data)

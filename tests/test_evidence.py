@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import re
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ SHA = "a516b748f6e62cef147c8229afe18b1538ddbb55"
 COMMIT_ID = "github:commit:octo-dev/reseau_graph8@" + SHA
 COMMENT_ID = "github:review_comment:modelcontextprotocol/python-sdk#3583/4102813786"
 ISSUE_ID = "linear:issue:HAR-98"
+REVIEW_ID = "github:review:octo-dev/sandbox#13/4779069846"
 PEOPLE = {"dev": {"github": "octo-dev", "linear": "00000000-0000-4000-8000-000000000001"}}
 
 
@@ -66,6 +68,15 @@ def test_linear_issue_fixture_produces_record():
         "2026-09-26T13:26:59.043Z", "2026-09-27T04:23:01.104Z", AT)
 
 
+def test_review_fixture_produces_record():
+    assert normalize(REVIEW_ID, fixture("github_reviews")) == Record(
+        REVIEW_ID, "github", "review", "4779069846",
+        "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-4779069846",
+        "The changes in expense.py replace the typing import.", Actor("github", "octo-dev"),
+        "2026-07-25T09:51:20Z", "2026-07-25T09:51:20Z", AT)
+    assert normalize(REVIEW_ID.replace("4779069846", "1"), fixture("github_reviews")) is None
+
+
 def test_commit_without_linked_account_is_name_only():
     c = fixture("github_commit")
     c["author"] = None
@@ -74,7 +85,7 @@ def test_commit_without_linked_account_is_name_only():
 
 # ---- activity_id ----
 
-@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, ISSUE_ID])
+@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, REVIEW_ID, ISSUE_ID])
 def test_activity_id_round_trip(aid):
     assert evidence.format_id(*evidence.parse(aid)) == aid
 
@@ -139,6 +150,15 @@ def test_review_comment_found_on_a_later_page():
     assert calls[1]["after"] == page1["pageInfo"]["endCursor"] and "after" not in calls[0]
 
 
+def test_review_found_on_the_next_numbered_page(monkeypatch):
+    monkeypatch.setattr(github, "PER_PAGE", 2)  # the 2-review fixture is then a full page
+    call, calls = fake((json.dumps(fixture("github_reviews")), False), ('[{"id": 7, "state": "APPROVED", '
+        '"html_url": "https://github.com/octo-dev/sandbox/pull/13#pullrequestreview-7", "submitted_at": null}]', False))
+    rec = run(evidence.get_evidence(call, REVIEW_ID.replace("4779069846", "7"), {}))
+    assert (rec.activity_id, rec.title) == (REVIEW_ID.replace("4779069846", "7"), "APPROVED")
+    assert [c.get("page") for c in calls] == [None, 2]
+
+
 def test_review_comment_missing_after_last_page_is_not_found():
     call, calls = fake((json.dumps(fixture("github_review_comments")), False), ('{"review_threads":[],"pageInfo":{}}', False))
     with pytest.raises(MCPError) as e:
@@ -198,6 +218,30 @@ def test_green_get_evidence_resolves_all_four_kinds(gateway_up):
         assert datetime.fromisoformat(r["fetched_at"]).tzinfo is not None
     assert [(r["actor"]["person"], r["actor"]["identity"]) for r in recs] == [
         ("dev", "mapped"), ("dev", "mapped"), (None, "unmapped"), ("dev", "mapped")]
+
+
+def test_red_github_scope_blocks_raw_tools_and_evidence_before_the_upstream(gateway_up):
+    gh = dataclasses.replace(gateway_up[0], repo_scoped=True)
+    env = dict(ENV, RESEAU_GITHUB_SCOPE="octo-dev")
+    out_of_scope = {"method": "get", "owner": "modelcontextprotocol", "repo": "python-sdk", "pullNumber": 3583}
+
+    async def go():
+        async with Gateway([gh, gateway_up[1]], env, identities=PEOPLE) as gw:
+            ok = (await gw.call("get_evidence", {"activity_id": PR_ID})).structured_content
+            errors = []
+            for call in (gw.call("github_pull_request_read", out_of_scope),
+                         gw.call("get_evidence", {"activity_id": COMMENT_ID}),
+                         gw.call("github_get_commit", {"owner": "OCTO-DEV-2", "repo": "x", "sha": "abc1234"})):
+                with pytest.raises(MCPError) as e:
+                    await call
+                errors.append(e.value)
+            linear = (await gw.call("get_evidence", {"activity_id": ISSUE_ID})).structured_content  # not GitHub
+            return ok, errors, linear
+
+    ok, errors, linear = run(go())
+    assert ok["activity_id"] == PR_ID and linear["activity_id"] == ISSUE_ID
+    assert [(e.code, e.data["kind"]) for e in errors] == [(-32012, "out_of_scope")] * 3
+    assert "modelcontextprotocol/python-sdk is outside RESEAU_GITHUB_SCOPE" in errors[0].message
 
 
 @pytest.mark.parametrize("aid", ["github:pr:octo-dev/reseau_graph8#9", "github:commit:octo-dev/reseau_graph8@deadbeef",
