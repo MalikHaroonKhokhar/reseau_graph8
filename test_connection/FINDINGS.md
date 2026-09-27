@@ -99,6 +99,7 @@ Every server ships Streamable HTTP. Legacy SSE lingers on some, but Linear and S
 | `uvx` | `[Errno 2] No such file or directory: 'uvx'` | **absent** |
 | `python3` | `unhandled errors in a TaskGroup` (process ran, handshake failed as designed) | **present** |
 | `sh` | `unhandled errors in a TaskGroup` | **present** |
+| `bash` | same (verified in `spikes/claims_check`) | **present** |
 
 So the spawn host is a Python image with no Node and no uv. `mcp-remote` (Node) cannot run there. Two follow-ups on the Python route:
 
@@ -353,7 +354,7 @@ _Pending: the 6-hour `long` run is still in progress. This section gets its resu
 
 ---
 
-# Run 5 — does the outbound `sse` client authenticate upstream? (2026-09-27)
+# Run 6 — does the outbound `sse` client authenticate upstream? (2026-09-27)
 
 Closes the gap a missing field alone cannot close: whether Graph8's `sse` client performs OAuth against an upstream that challenges it. Four legacy-SSE endpoints registered as `transport_type: "sse"`, `/test` called, each deleted (final `GET /workflows/mcp-servers` → `{"servers":[],"total":0}`).
 
@@ -370,7 +371,7 @@ Note on the docs: `BearerAuth` on those operation pages is the **caller's** Grap
 
 Source: [Connect an MCP server](https://docs.graph8.com/developers/api-reference/operations/create_mcp_server_voice_mcp_servers_post/), which also states `env_vars` "is write-only by convention on this surface — the read routes return the server's tools, not its environment". Run 3 disproved that guarantee (HAR-96).
 
-## Run 5b — is an undocumented `headers` field honoured? (2026-09-27)
+## Run 6b — is an undocumented `headers` field honoured? (2026-09-27)
 
 Registered `be.graph8.com/mcp/sse` (401 without a token, negotiates 2024-11-05 with one) three ways, `/test` each, all deleted:
 
@@ -386,7 +387,7 @@ In all three the stored record contained **no** `headers`/`auth`/`bearer_token` 
 
 **The clean positive control is the Réseau gateway itself**, which is real legacy SSE (like CoinGecko, which emits `event: endpoint` and connects: `success: true, tools_count: 2`). Once it is publicly reachable: `/g8/<token>/sse` should connect (credential in the path) while the same URL without the path token, with the credential supplied only via `headers`, should fail. That pair settles it definitively.
 
-## Run 5c — transport isolated on one server (2026-09-27)
+## Run 6c — transport isolated on one server (2026-09-27)
 
 `mcp.api.coingecko.com` exposes both transports with no auth on either: `/sse` is legacy HTTP+SSE (GET emits `event: endpoint`) and `/mcp` is Streamable HTTP (POST `initialize` → 200, protocol 2025-06-18; GET → 404). Registered both as `transport_type: "sse"`, `/test` each, both deleted.
 
@@ -399,7 +400,7 @@ Same host, same tool surface, same (absent) credentials, same client, same user-
 
 **Graph8's outbound `sse` is the deprecated 2024-11-05 HTTP+SSE transport.** Combined with Run 5 (auth) and the contract (no credential field), the three blockers are each isolated by a controlled test.
 
-## Run 5d — the transport enum is enforced server-side, and the gateway is green (2026-09-27)
+## Run 6d — the transport enum is enforced server-side, and the gateway is green (2026-09-27)
 
 Five spellings of a Streamable-HTTP transport value, all rejected by Graph8's own validator:
 
@@ -419,7 +420,7 @@ So the closed enum is enforced, not merely documented. There is no undocumented 
 
 The listing echoes `connection_url` with the gateway token in plaintext (HAR-96 again), which is why that token is gateway-scoped and rotatable.
 
-## Run 5e — the connector OAuth set does not include GitHub or Linear (2026-09-27)
+## Run 6e — the connector OAuth set does not include GitHub or Linear (2026-09-27)
 
 Graph8 does hold outbound OAuth credentials for a fixed provider set, through a hosted flow (`POST /api/v1/integrations/connections/session-token`, whose docs describe `provider_config_key` as "the key in the connection provider's own config" — a Nango-style hosted OAuth). Minting a session token per provider, identical call shape each time:
 
@@ -436,3 +437,19 @@ Graph8 does hold outbound OAuth credentials for a fixed provider set, through a 
 So the connector layer is CRM-shaped and GitHub/Linear have no working connector in it. Two honest caveats: a 500 is an unhandled error rather than a declared "unsupported", so this shows no working connector exists, not the internal reason (an unknown provider key returning 500 instead of a 4xx is itself worth reporting); and the marketing integrations page lists GitHub and Linear under 500+ **data-pipeline sources**, which is a different system (ELT into the CDP) from this connections flow.
 
 **This does not reach MCP either way.** The connection layer's routes are `/integrations/crm/connections/{id}/contacts|companies|deals|leads` — record sync — while `POST /voice/mcp-servers` accepts `{name, description, enabled, transport_type, connection_url, command, args, env_vars}` with no field that can reference a `connection_id`. A connected HubSpot cannot lend its credential to an MCP registration, let alone an unconnected GitHub.
+
+## Run 6f — verification pass, and two corrections (`spikes/claims_check/verify_claims.py`, 2026-09-27)
+
+Every claim above was re-run live. Ten held as written; two were wrong and two need tighter wording.
+
+**Corrected — the stdio runtime.** "Only `python3` and `sh`" is wrong: **`bash` is present too**. What is actually absent is `npx`, `uvx`, `node` and `mcp-proxy` (and `import mcp_proxy` fails). The accurate phrasing is **"no Node or uv tooling at all"**, not a two-binary allowlist.
+
+**Corrected — "never for an arbitrary MCP server".** Overstated. `env_vars` stores secrets for **any** stdio registration, and Run 3's own bridge authenticated exactly that way (`UPSTREAM_TOKEN`). The accurate claim is narrower and still sufficient: **a remote (`sse`) registration has no credential field at all**; a `stdio` one can carry secrets, at the cost of shipping them into a store the read route echoes in plaintext (HAR-96).
+
+**Tightened — the auth timings.** Re-measured, the OAuth-guarded `/sse` failures were 0.68 s, 0.76 s and **1.22 s** (Atlassian), so "under 1.1 s" does not hold across runs. Timing is corroborating evidence at best; the primary argument is the absent credential field, and the verification confirmed all three routes are live and OAuth-guarded (401 + Bearer challenge) rather than missing.
+
+**Tightened — the tool-count arithmetic.** 45 + 59 + 126 = 230 raw, but the gateway reads the read-only endpoints first (27 + 35 + 126 = **188**) and the allowlist cuts that to 14. Quote it as "188 → 14 after allowlisting, from 230 raw" rather than "230 → 14".
+
+**Provenance note:** the "It is closed to those two here" sentence is the OpenAPI description for `POST /voice/mcp-servers` (`be.graph8.com/api/v1/openapi.json`); it reaches readers through the rendered operation page at `docs.graph8.com/developers/api-reference/operations/create_mcp_server_voice_mcp_servers_post/`, which is where it was first read here.
+
+**Also confirmed independently:** the 422 enum (five spellings), the CoinGecko same-host A/B (both paths serve the identical two tools, `execute` and `search_docs`, with no auth), the silently-discarded canary fields, GitHub and Linear both 401-with-Bearer-challenge on Streamable HTTP with Linear's `/sse` at 404, and the inbound protected-resource metadata pointing at `auth.graph8.com/oauth/2.1`.
