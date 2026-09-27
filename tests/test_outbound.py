@@ -153,6 +153,14 @@ class OutboundTest(unittest.TestCase):
         c, _ = client(Fake((202, {}, b"")))
         self.assertIsNone(c.rpc(URL, {"jsonrpc": "2.0", "method": "notifications/initialized"}).data)
 
+    def test_cap_is_looked_up_per_host(self):
+        caps = {u: outbound.max_per_host(host_key(u)) for u in (
+            "https://api.githubcopilot.com/mcp/readonly", "https://API.GitHubCopilot.com.:443/x",
+            "https://mcp.linear.app/mcp/readonly", "https://be.graph8.com/mcp/", "https://example.com/")}
+        self.assertEqual(list(caps.values()), [8, 8, 4, 2, outbound.MAX_PER_HOST])
+        self.assertEqual(Client()._slot(host_key("https://api.githubcopilot.com/"))._value, 8)
+        self.assertEqual(Client(max_per_host=3)._slot(host_key("https://api.githubcopilot.com/"))._value, 3)
+
     def test_concurrency_capped_per_host(self):
         cond, gate, state = threading.Condition(), threading.Event(), {"now": 0, "max": 0, "total": 0}
 

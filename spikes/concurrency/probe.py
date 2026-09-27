@@ -4,7 +4,7 @@
 Two views per call:
   raw      one Streamable HTTP session per upstream over outbound.http_transport: same UA, headers and endpoint as
            the gateway, but no retry and no per-host cap, so upstream status codes, content types and 429s show as-is.
-  gateway  reseau.gateway.Gateway with its real policy (MAX_PER_HOST cap, backoff): what an agent turn sees.
+  gateway  reseau.gateway.Gateway with its real policy (per-host cap, backoff): what an agent turn sees.
 
 Calls are read-only and allowlisted: github get_me, linear list_teams. OAuth refresh is not applicable (static
 Linear API key and GitHub PAT) and is not tested.
@@ -36,6 +36,10 @@ CALLS = {"github": "get_me", "linear": "list_teams"}
 UPSTREAMS = {u.name: u for u in gateway.DEFAULT_UPSTREAMS}
 PROTOCOL = "2025-06-18"
 KEEP_HEADERS = ("retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "cf-mitigated")
+
+
+def cap(name):
+    return outbound.max_per_host(outbound.host_key(UPSTREAMS[name].url))
 
 
 def sid_hash(sid):
@@ -165,9 +169,9 @@ async def load(names, levels, pause=5.0):
             for n in levels:
                 summ = summarize(await gateway_burst(gw, name, CALLS[name], n))
                 results[name]["gateway"][n] = summ
-                print(name, "gateway N=%d cap=%d" % (n, outbound.MAX_PER_HOST), summ["rpc"], "p50", summ["p50_ms"], "max", summ["max_ms"])
+                print(name, "gateway N=%d cap=%d" % (n, cap(name)), summ["rpc"], "p50", summ["p50_ms"], "max", summ["max_ms"])
                 await anyio.sleep(pause)
-    results["_meta"] = {"levels": levels, "max_per_host": outbound.MAX_PER_HOST, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    results["_meta"] = {"levels": levels, "max_per_host": {n: cap(n) for n in names}, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     with open(os.path.join(HERE, "load_results.json"), "w") as f:
         json.dump(results, f, indent=1)
 
