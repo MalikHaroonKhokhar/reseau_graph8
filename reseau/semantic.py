@@ -15,9 +15,15 @@ The ticket's open assumptions, checked against the live upstreams on 2026-09-27:
 - Unresolved review comments: the GitHub MCP's get_review_comments returns review threads with is_resolved.
   Each unresolved thread is one fact, identified by its first comment.
 - Commits: GitHub's commit search index lags by weeks (on 2026-09-27 the newest indexed commit was from
-  2026-08-05). So commits come from list_commits over the person's active repos: repos they own that were
-  pushed since the day began, plus repos of PRs they're involved in. Only default-branch commits count, and
-  a commit belongs to the day it was committed.
+  2026-08-05). So commits come from list_commits on every branch of every in-scope repo pushed since the day
+  began, unmerged feature branches included, deduplicated by SHA. A commit belongs to the day it was
+  committed.
+- GitHub scope is a permission: the tools read only the person's own account plus the owners and repos
+  listed in RESEAU_GITHUB_SCOPE. Every search carries those qualifiers and results are rechecked against
+  them, so an org's repos are never read until the org is listed. A Linear-linked PR outside the scope is
+  not read either; incomplete says one was skipped, without naming its repo.
+- Nothing is dropped silently: every listing follows its pages up to a safety limit, and each answer's
+  incomplete names every listing that stopped with pages left or that GitHub marked incomplete.
 - Linear moves: stateHistory records when an issue changed state, not who changed it. A person's moves are
   therefore the state changes of issues assigned to them.
 """
@@ -38,9 +44,13 @@ from reseau.evidence import github, linear
 from reseau.evidence.records import Actor, Record
 
 TZ_ENV = "RESEAU_TIMEZONE"
+SCOPE_ENV = "RESEAU_GITHUB_SCOPE"
+SCOPE_ENTRY = re.compile(r"[\w.-]+(/[\w.-]+)?")
 INVALID_PARAMS = -32602
 UNMAPPED_PERSON = -32011  # continues evidence's codes
 PAGE = 100
+MAX_PAGES = evidence.MAX_PAGES  # safety limit per listing; GitHub search serves at most 10 pages of 100 anyway
+BRANCH_PAGES = 1  # 100 branches per repo: each costs a list_commits call
 FOCUS_MAX = 3
 PRIORITY_RANK = {1: 0, 2: 1, 3: 2, 4: 3}  # Linear: 1 Urgent .. 4 Low; 0 (no priority) sorts after Low
 OPEN_STATES = ("started", "unstarted", "backlog")  # Linear state types a focus issue can be in, in focus order
@@ -62,11 +72,22 @@ class Activity:
 
 
 @dataclass(frozen=True)
+class Gap:
+    """A listing the answer may be missing results from, stated instead of dropped silently."""
+    source: str
+    tool: str
+    reason: str  # page_limit | search_incomplete | out_of_scope
+    detail: str
+
+
+@dataclass(frozen=True)
 class PersonActivity:
     person: str
     date: str
     timezone: str
+    github_scope: list[str]  # the GitHub owners and repos read: the person's account, then RESEAU_GITHUB_SCOPE
     activities: list[Activity]  # oldest first
+    incomplete: list[Gap]
 
 
 @dataclass(frozen=True)
@@ -114,9 +135,11 @@ class MyDay:
     me: Actor  # GitHub identity of the gateway's token, with the Réseau person when mapped
     date: str
     timezone: str
+    github_scope: list[str]
     focus: list[Focus]  # highest-priority open Linear issues assigned to me, at most FOCUS_MAX
     needs_attention: list[Attention]  # my open PRs with unresolved review threads
     yesterday: Commits
+    incomplete: list[Gap]
 
 
 TOOLS = [
@@ -124,7 +147,8 @@ TOOLS = [
         name="get_person_activity",
         description="One person's activity on one day, as records with activity_ids: commits, PRs opened and "
                     "merged, reviews, and Linear issues moved or completed. person is a name from Réseau's "
-                    "identity map; date is YYYY-MM-DD in the gateway's timezone.",
+                    "identity map; date is YYYY-MM-DD in the gateway's timezone. GitHub facts cover "
+                    "github_scope only; incomplete lists anything that may be missing.",
         input_schema={"type": "object", "properties": {"person": {"type": "string"}, "date": {"type": "string"}},
                       "required": ["person", "date"]},
         output_schema=TypeAdapter(PersonActivity).json_schema()),
@@ -133,7 +157,8 @@ TOOLS = [
         description="Structured facts for starting the caller's day, each with activity_ids: focus (the "
                     "highest-priority open Linear issues assigned to them, with the open PRs they wait on), "
                     "needs_attention (unresolved review threads on their open PRs), and yesterday (commit "
-                    "and repository counts).",
+                    "and repository counts). GitHub facts cover github_scope only; incomplete lists anything "
+                    "that may be missing.",
         input_schema={"type": "object", "properties": {}},
         output_schema=TypeAdapter(MyDay).json_schema()),
 ]
@@ -141,6 +166,16 @@ TOOLS = [
 
 def load_tz(env=os.environ):
     return ZoneInfo(env.get(TZ_ENV) or "UTC")
+
+
+def load_scope(env=os.environ):
+    """RESEAU_GITHUB_SCOPE: comma-separated owners (users or orgs) and owner/repo entries the semantic tools
+    may read besides the person's own account. Unset = nothing else."""
+    entries = [e.strip() for e in (env.get(SCOPE_ENV) or "").split(",") if e.strip()]
+    bad = [e for e in entries if not SCOPE_ENTRY.fullmatch(e)]
+    if bad:
+        raise ValueError("%s: not an owner or owner/repo: %s" % (SCOPE_ENV, ", ".join(bad)))
+    return tuple(entries)
 
 
 def now():
@@ -184,10 +219,12 @@ def repo_args(full):
 
 class Upstreams:
     """The upstream questions behind the tools, answered with normalized records. call_tool is
-    Gateway.call_tool, so the allowlist and redaction apply. Independent calls run concurrently."""
+    Gateway.call_tool, so the allowlist and redaction apply. Independent calls run concurrently. GitHub reads
+    stay inside scope (the person's login, then RESEAU_GITHUB_SCOPE); gaps collects what may be missing."""
 
-    def __init__(self, call_tool, index, at):
+    def __init__(self, call_tool, index, at, scope):
         self.call, self.index, self.at = call_tool, index, at.isoformat(timespec="seconds")
+        self.scope, self.gaps = list(scope), []
 
     async def json(self, source, tool, args):
         return await evidence.fetch_json(self.call, source, tool, args)
@@ -195,51 +232,84 @@ class Upstreams:
     def rec(self, normalize, payload):
         return evidence.resolve(normalize(payload, {}, self.at), self.index)
 
-    async def items(self, tool, query):
-        page = await self.json("github", tool, {"query": query, "perPage": PAGE} |
-                               ({"fields": PR_FIELDS} if tool == "search_pull_requests" else {}))
-        return (page or {}).get("items") or []  # ponytail: first 100 results only
+    def in_scope(self, full):
+        owner, full = full.split("/")[0].casefold(), full.casefold()
+        return any(e.casefold() in (owner, full) for e in self.scope)
 
-    async def me(self):
-        return (await self.json("github", "get_me", {}))["login"]
+    async def collect(self, source, tool, args, items, advance, limit=None):
+        """Every page of a listing, up to a safety limit of pages; stopping with pages left adds a gap."""
+        limit = limit or MAX_PAGES
+        out = []
+        for _ in range(limit):
+            payload = await self.json(source, tool, args)
+            if payload is None:
+                return out
+            out += items(payload)
+            args = advance(payload, args)
+            if not args:
+                return out
+        what = {k: v for k, v in args.items() if k not in ("page", "after", "cursor", "perPage", "limit", "fields")}
+        self.gaps.append(Gap(source, tool, "page_limit", "stopped after %d pages with more left: %s" % (limit, what)))
+        return out
+
+    async def listing(self, tool, args, limit=None):
+        """A GitHub tool answering with a JSON list, in numbered pages."""
+        return await self.collect("github", tool, args | {"perPage": PAGE}, lambda page: page, github.next_page,
+                                  limit)
+
+    async def search(self, tool, query):
+        """A GitHub search inside the scope: GitHub ORs the user:/repo: qualifiers, and every result is
+        rechecked, so nothing outside the scope is ever returned."""
+        query = " ".join([query] + [("repo:" if "/" in e else "user:") + e for e in self.scope])
+
+        def items(page):
+            if page.get("incomplete_results"):
+                self.gaps.append(Gap("github", tool, "search_incomplete", "GitHub timed out on %r" % query))
+            return page.get("items") or []
+
+        found = await self.collect(
+            "github", tool, {"query": query, "perPage": PAGE} | ({"fields": PR_FIELDS} if "pull" in tool else {}),
+            items, lambda page, args: github.next_page(page.get("items") or [], args))
+        return [i for i in found if self.in_scope(i["full_name"] if "full_name" in i else github.repo(i["html_url"]))]
+
+    async def issues(self, args):
+        return await self.collect("linear", "list_issues", args | {"limit": PAGE},
+                                  lambda page: page.get("issues") or [], next_cursor)
 
     async def commits(self, login, start, end):
-        owned, involved = await gather(
-            partial(self.items, "search_repositories", "user:%s fork:true pushed:>=%s" % (login, utc(start))),
-            partial(self.items, "search_pull_requests", "involves:%s updated:>=%s" % (login, utc(start))))
-        repos = sorted({r["full_name"] for r in owned} | {github.repo(p["html_url"]) for p in involved})
-        pages = await gather(*[partial(self.json, "github", "list_commits", repo_args(r) | {
-            "author": login, "since": utc(start), "until": utc(end), "perPage": PAGE}) for r in repos])
-        recs = [self.rec(github.commit, c) for page in pages for c in page or []]
-        return [Activity(r.activity_id, "commit", r.updated_at, r) for r in recs]  # at = committed at
+        """The person's commits on every branch of every in-scope repo pushed since the day began."""
+        repos = sorted({r["full_name"] for r in await self.search("search_repositories",
+                                                                  "fork:true pushed:>=%s" % utc(start))})
+        branches = await gather(*[partial(self.listing, "list_branches", repo_args(r), BRANCH_PAGES) for r in repos])
+        window = {"author": login, "since": utc(start), "until": utc(end)}
+        pages = await gather(*[partial(self.listing, "list_commits", repo_args(r) | {"sha": b["name"]} | window)
+                               for r, names in zip(repos, branches) for b in names])
+        recs = {rec.activity_id: rec for page in pages for c in page for rec in [self.rec(github.commit, c)]}
+        return [Activity(r.activity_id, "commit", r.updated_at, r) for r in recs.values()]  # at = committed at
 
     async def prs(self, login, start, end):
         found = {p["html_url"]: p for page in await gather(*[
-            partial(self.items, "search_pull_requests", "author:%s %s:%s..%s" % (login, q, utc(start), utc(end)))
+            partial(self.search, "search_pull_requests", "author:%s %s:%s..%s" % (login, q, utc(start), utc(end)))
             for q in ("created", "merged")]) for p in page}
         return [a for p in found.values() for a in pr_activities(p, self.rec(github.pr, p))]
 
     async def reviews(self, login, start):
-        prs = await self.items("search_pull_requests", "reviewed-by:%s updated:>=%s" % (login, utc(start)))
-        pages = await gather(*[partial(self.json, "github", "pull_request_read", repo_args(github.repo(p["html_url"]))
-                                       | {"method": "get_reviews", "pullNumber": p["number"], "perPage": PAGE})
-                               for p in prs])
+        prs = await self.search("search_pull_requests", "reviewed-by:%s updated:>=%s" % (login, utc(start)))
+        pages = await gather(*[partial(self.listing, "pull_request_read", repo_args(github.repo(p["html_url"]))
+                                       | {"method": "get_reviews", "pullNumber": p["number"]}) for p in prs])
         return [Activity(rec.activity_id, "review", r["submitted_at"], rec, r.get("state"))
-                for page in pages for r in reviews_by(login, page or []) for rec in [self.rec(github.review, r)]]
+                for page in pages for r in reviews_by(login, page) for rec in [self.rec(github.review, r)]]
 
     async def issue_moves(self, linear_id, start):
-        page = await self.json("linear", "list_issues", {"assignee": linear_id, "updatedAt": utc(start),
-                                                         "limit": PAGE, "fields": ["id"]})
+        listed = await self.issues({"assignee": linear_id, "updatedAt": utc(start), "fields": ["id"]})
         # ponytail: one get_issue per issue, for its stateHistory
-        issues = await gather(*[partial(self.json, "linear", "get_issue", {"id": i["id"]})
-                                for i in (page or {}).get("issues") or []])
+        issues = await gather(*[partial(self.json, "linear", "get_issue", {"id": i["id"]}) for i in listed])
         return [a for i in issues if i for a in issue_moves(i, self.rec(linear.issue, i))]
 
     async def focus(self):
-        pages = await gather(*[partial(self.json, "linear", "list_issues", {
-            "assignee": "me", "state": state, "limit": PAGE, "fields": ISSUE_FIELDS}) for state in OPEN_STATES])
-        items = await gather(*[partial(self.focus_item, i)
-                               for i in focus_order([i for page in pages for i in (page or {}).get("issues") or []])])
+        pages = await gather(*[partial(self.issues, {"assignee": "me", "state": state, "fields": ISSUE_FIELDS})
+                               for state in OPEN_STATES])
+        items = await gather(*[partial(self.focus_item, i) for i in focus_order([i for page in pages for i in page])])
         return [f for f in items if f]
 
     async def focus_item(self, listed):
@@ -250,6 +320,11 @@ class Upstreams:
                                               for b in (issue.get("relations") or {}).get("blockedBy") or []])
                     if b and b.get("statusType") not in CLOSED_STATES]
         links = [(src, link) for src in [issue] + blockers for link in pr_links(src)]
+        skipped = [link for _, link in links if not self.in_scope("%s/%s" % link[:2])]
+        if skipped:  # the repo stays unnamed: outside the scope means not shown
+            self.gaps.append(Gap("github", "pull_request_read", "out_of_scope", "%s: %d linked PR(s) outside the "
+                                 "GitHub scope were not read" % (issue["id"], len(skipped))))
+        links = [(src, link) for src, link in links if link not in skipped]
         prs = await gather(*[partial(self.json, "github", "pull_request_read", {
             "method": "get", "owner": owner, "repo": name, "pullNumber": int(number)})
             for _, (owner, name, number) in links])
@@ -261,19 +336,14 @@ class Upstreams:
                      [self.rec(linear.issue, b).activity_id for b in blockers])
 
     async def needs_attention(self, login):
-        prs = await self.items("search_pull_requests", "author:%s is:open archived:false" % login)
+        prs = await self.search("search_pull_requests", "author:%s is:open archived:false" % login)
         return [a for a in await gather(*[partial(self.attention, p) for p in prs]) if a]
 
     async def attention(self, p):
-        args = repo_args(github.repo(p["html_url"])) | {"method": "get_review_comments", "pullNumber": p["number"],
-                                                        "perPage": PAGE}
-        threads = []
-        for _ in range(evidence.MAX_PAGES):
-            page = await self.json("github", "pull_request_read", args) or {}
-            threads += page.get("review_threads") or []
-            args = github.review_comment_next(page, args)
-            if not args:
-                break
+        threads = await self.collect(
+            "github", "pull_request_read", repo_args(github.repo(p["html_url"])) | {
+                "method": "get_review_comments", "pullNumber": p["number"], "perPage": PAGE},
+            lambda page: page.get("review_threads") or [], github.review_comment_next)
         found = [Thread(r.activity_id, r, len(t["comments"]))
                  for t in unresolved(threads) for r in [self.rec(github.comment, t["comments"][0])]]
         rec = self.rec(github.pr, p)
@@ -335,6 +405,11 @@ def pr_links(issue):
     return [m.groups() for a in issue.get("attachments") or [] if (m := PR_URL.match(a.get("url") or ""))]
 
 
+def next_cursor(page, args):
+    """Linear's cursor pages."""
+    return dict(args, cursor=page["cursor"]) if page.get("hasNextPage") and page.get("cursor") else None
+
+
 def unresolved(threads):
     return [t for t in threads if not t.get("is_resolved") and t.get("comments")]
 
@@ -356,7 +431,8 @@ async def person_activity(gw, args):
         raise error(UNMAPPED_PERSON, "unmapped_person", "%r is not in the identity map (%s)"
                     % (person, evidence.IDENTITIES_ENV), person=person)
     start, end = day_window(day, gw.tz)
-    up = Upstreams(gw.call_tool, gw.identities, now())
+    scope = [ids["github"], *gw.github_scope] if "github" in ids else []
+    up = Upstreams(gw.call_tool, gw.identities, now(), scope)
     calls = []
     if "github" in ids:
         login = ids["github"]
@@ -365,20 +441,20 @@ async def person_activity(gw, args):
     if "linear" in ids:
         calls.append(partial(up.issue_moves, ids["linear"], start))
     found = [a for part in await gather(*calls) for a in part]
-    return PersonActivity(person, day.isoformat(), str(gw.tz), on_day(found, start, end))
+    return PersonActivity(person, day.isoformat(), str(gw.tz), scope, on_day(found, start, end), up.gaps)
 
 
 async def my_day(gw, args):
     at = now()
-    up = Upstreams(gw.call_tool, gw.identities, at)
-    login = await up.me()
+    login = (await evidence.fetch_json(gw.call_tool, "github", "get_me", {}))["login"]
+    up = Upstreams(gw.call_tool, gw.identities, at, [login, *gw.github_scope])
     today = at.astimezone(gw.tz).date()
     yesterday = today - timedelta(days=1)
     start, end = day_window(yesterday, gw.tz)
     focus, attention, commits = await gather(up.focus, partial(up.needs_attention, login),
                                              partial(up.commits, login, start, end))
     return MyDay(evidence.resolve_actor(Actor("github", login), gw.identities), today.isoformat(), str(gw.tz),
-                 focus, attention, commit_summary(yesterday, on_day(commits, start, end)))
+                 up.scope, focus, attention, commit_summary(yesterday, on_day(commits, start, end)), up.gaps)
 
 
 HANDLERS = {"get_person_activity": person_activity, "get_my_day_context": my_day}

@@ -21,14 +21,14 @@ def mocks():
         yield gh, lin
 
 
-async def serving(mocks, body, tokens=(TOK,), identities=None):
+async def serving(mocks, body, tokens=(TOK,), identities=None, env=None):
     """Gateway over the mocks, fronted by front.app on a loopback port; body(base_url) runs against it."""
     gh, lin = mocks
     ups = [Upstream("github", gh.url, "GITHUB_MCP_TOKEN"), Upstream("linear", lin.url, "LINEAR_API_KEY")]
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     base = "http://127.0.0.1:%d" % sock.getsockname()[1]
-    async with Gateway(ups, {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN}, identities) as gw:
+    async with Gateway(ups, {"GITHUB_MCP_TOKEN": GH_TOKEN, "LINEAR_API_KEY": LIN_TOKEN, **(env or {})}, identities) as gw:
         srv = front.uvicorn.Server(front.uvicorn.Config(front.app(gw, list(tokens)), log_level="warning",
                                                         access_log=False, lifespan="off"))
         async with anyio.create_task_group() as tg:

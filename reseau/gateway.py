@@ -65,14 +65,20 @@ class Upstream:
     # Raw tool names this upstream may list and call; None = pass everything through. A blocked call is
     # rejected before it reaches the upstream. The bootstrap tool is called internally either way.
     allow: frozenset[str] | None = None
+    # Raw tool names only Réseau's own tools may call (Gateway.call_tool): never listed, never routed for a
+    # client. For tools that would widen what a client can reach, e.g. GitHub search across every repo.
+    internal: frozenset[str] = frozenset()
 
 
 # Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
 # plus a minimal allowlist for the semantic tools (HAR-100, HAR-101, HAR-109); grow it from those tickets.
+# GitHub's search and branch listing are internal: the semantic tools scope every query to the person's own
+# account plus RESEAU_GITHUB_SCOPE, and a client calling them raw could reach any org repo the token sees.
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
-                              "list_issues", "issue_read", "search_pull_requests", "search_repositories"})),
+                              "list_issues", "issue_read"}),
+             internal=frozenset({"search_pull_requests", "search_repositories", "list_branches"})),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
                               "get_project"})),
@@ -321,6 +327,7 @@ class Gateway:
         self.env = env
         self.identities = evidence.load_identities(env) if identities is None else evidence.identity_index(identities)
         self.tz = semantic.load_tz(env)
+        self.github_scope = semantic.load_scope(env)
         self.secrets = SECRETS
         install_log_redaction()
         self.conns = {u.name: _Conn(u) for u in upstreams}
@@ -435,7 +442,7 @@ class Gateway:
     async def call_tool(self, name, tool, arguments=None):
         c = self._conn(name)
         up = c.upstream
-        if not allowed(up, tool):
+        if not allowed(up, tool) and tool not in up.internal:
             raise UpstreamError(TOOL_NOT_ALLOWED, "%s: tool %r is not allowlisted" % (name, tool), name, "tool_not_allowed")
         args = arguments or {}
 

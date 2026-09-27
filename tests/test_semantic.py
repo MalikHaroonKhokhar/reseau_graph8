@@ -1,6 +1,9 @@
 """HAR-100: get_person_activity and get_my_day_context. Pure aggregation, both tools over a scripted world of
 upstream answers (built from the recorded fixtures), and both tools over MCP through the gateway."""
 import copy
+import dataclasses
+import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -21,7 +24,8 @@ from tests.test_gateway import GH_TOKEN, LIN_TOKEN, run
 NOW = datetime(2026, 9, 27, 9, tzinfo=timezone.utc)
 TODAY, YESTERDAY = "2026-09-27", "2026-09-26"
 LOGIN, LINEAR_ID = PEOPLE["dev"]["github"], PEOPLE["dev"]["linear"]
-RG, UI = "octo-dev/reseau_graph8", "octo-dev/ui-critic"
+RG, UI = "octo-dev/reseau_graph8", "private-org/ui-critic"  # UI is an org repo: read only once "private-org" is in scope
+SCOPE = ("private-org",)
 
 
 # ---- the scripted world: what GitHub and Linear answer, in their recorded shapes ----
@@ -74,12 +78,37 @@ def not_found(what):
     raise RuntimeError("failed to get %s: 404 Not Found []" % what)
 
 
+def gh_page(items, a):
+    """GitHub's numbered pages."""
+    k, per = a.get("page", 1), a["perPage"]
+    return items[(k - 1) * per:k * per]
+
+
+def search_page(items, a):
+    return {"total_count": len(items), "incomplete_results": False, "items": gh_page(items, a)}
+
+
+def linear_page(items, a):
+    """Linear's cursor pages."""
+    k, per = int(a.get("cursor") or 0), a["limit"]
+    return {"issues": items[k:k + per], "hasNextPage": k + per < len(items), "cursor": str(k + per)}
+
+
+def scoped(query, repos):
+    """GitHub ORs user:/repo: qualifiers: keep the repos they name."""
+    owners, named = set(re.findall(r"\buser:(\S+)", query)), set(re.findall(r"\brepo:(\S+)", query))
+    return [r for r in repos if r.split("/")[0] in owners or r in named]
+
+
 def world(empty=False):
-    """{source: {tool: fn(args) -> payload}}. Searches ignore their date qualifiers, as a mock can, so the
-    day filtering under test is Réseau's own."""
-    commits = {RG: [commit(RG, n, "2026-09-26T%02d:00:00Z" % (8 + n)) for n in range(4)]
-                   + [commit(RG, 9, "2026-09-27T00:30:00Z")],  # today, not yesterday
-               UI: [commit(UI, 10, "2026-09-26T00:00:00Z"), commit(UI, 11, "2026-09-26T23:59:59Z")]}
+    """{source: {tool: fn(args) -> payload}}, paged like the real upstreams. Date qualifiers and since/until
+    are ignored, as a mock can, so the day filtering under test is Réseau's own."""
+    main = [commit(RG, n, "2026-09-26T%02d:00:00Z" % (8 + n)) for n in range(3)] + [
+        commit(RG, 9, "2026-09-27T00:30:00Z")]  # today, not yesterday
+    commits = {(RG, "main"): main,
+               (RG, "feat/x"): [main[0], commit(RG, 3, "2026-09-26T11:00:00Z")],  # unmerged; main[0] is shared
+               (UI, "main"): [commit(UI, 10, "2026-09-26T00:00:00Z"), commit(UI, 11, "2026-09-26T23:59:59Z")]}
+    branches = {RG: ["main", "feat/x"], UI: ["main"]}
     reviews = fixture("github_reviews")
     reviews[1]["submitted_at"] = "2026-09-27T03:00:00Z"
     done = fixture("linear_issue")
@@ -98,14 +127,14 @@ def world(empty=False):
     def search_prs(a):
         q = a["query"]
         if q.startswith("author:%s is:open" % LOGIN):
-            return {"items": [search_item(RG, 20)]}
-        if q.startswith("involves:%s " % LOGIN):
-            return {"items": [search_item(UI, 9)]}
-        if q.startswith("author:%s " % LOGIN):  # created: and merged: both find #16 and #17
-            return fixture("github_search_prs")
-        if q.startswith("reviewed-by:%s " % LOGIN):
-            return {"items": [{"html_url": "https://github.com/octo-dev/sandbox/pull/13", "number": 13}]}
-        return {"items": []}
+            found = [search_item(RG, 20)]
+        elif q.startswith("author:%s " % LOGIN):  # created: and merged: both find #16 and #17
+            found = fixture("github_search_prs")["items"]
+        elif q.startswith("reviewed-by:%s " % LOGIN):
+            found = [{"html_url": "https://github.com/octo-dev/sandbox/pull/13", "number": 13}]
+        else:
+            found = []
+        return search_page([p for p in found if scoped(q, [github.repo(p["html_url"])])], a)
 
     def pull_request_read(a):
         key = ("%s/%s" % (a["owner"], a["repo"]), a["pullNumber"])
@@ -113,32 +142,36 @@ def world(empty=False):
             return prs.get(key) or not_found("pull request")
         if a["method"] == "get_review_comments":
             return threads(*key) if key == (RG, 20) else {"review_threads": [], "pageInfo": {}}
-        return reviews if key == ("octo-dev/sandbox", 13) else []
+        return gh_page(reviews if key == ("octo-dev/sandbox", 13) else [], a)
 
     def list_issues(a):
         if a.get("assignee") == "me":
-            return {"issues": focus[a["state"]], "hasNextPage": False}
-        return {"issues": [{"id": "HAR-98"}] if a.get("assignee") == LINEAR_ID else [], "hasNextPage": False}
+            return linear_page(focus[a["state"]], a)
+        return linear_page([{"id": "HAR-98"}] if a.get("assignee") == LINEAR_ID else [], a)
 
+    repo = lambda a: "%s/%s" % (a["owner"], a["repo"])
     gh = {"get_me": lambda a: {"login": LOGIN, "id": 1000001},
-          "search_repositories": lambda a: {"items": [{"full_name": RG}] if a["query"].startswith("user:" + LOGIN) else []},
+          "search_repositories": lambda a: search_page([{"full_name": r} for r in scoped(a["query"], [RG, UI])], a),
           "search_pull_requests": search_prs,
-          "list_commits": lambda a: commits.get("%s/%s" % (a["owner"], a["repo"]), []),
+          "list_branches": lambda a: gh_page([{"name": b, "sha": "0" * 40, "protected": False}
+                                              for b in branches.get(repo(a), [])], a),
+          "list_commits": lambda a: gh_page(commits.get((repo(a), a["sha"]), []), a),
           "pull_request_read": pull_request_read}
     lin = {"list_issues": list_issues,
            "get_issue": lambda a: issues.get(a["id"]) or not_found("issue")}
     if empty:
-        gh = {"get_me": gh["get_me"], "search_repositories": lambda a: {"items": []},
-              "search_pull_requests": lambda a: {"items": []}}
-        lin = {"list_issues": lambda a: {"issues": [], "hasNextPage": False}}
+        gh = {"get_me": gh["get_me"], "search_repositories": lambda a: search_page([], a),
+              "search_pull_requests": lambda a: search_page([], a)}
+        lin = {"list_issues": lambda a: linear_page([], a)}
     return {"github": gh, "linear": lin}
 
 
 class FakeGateway:
     """What the semantic handlers use of Gateway, answering from a scripted world."""
 
-    def __init__(self, w, tz="UTC", people=PEOPLE):
+    def __init__(self, w, tz="UTC", people=PEOPLE, scope=SCOPE):
         self.world, self.tz, self.identities, self.calls = w, ZoneInfo(tz), evidence.identity_index(people), []
+        self.github_scope = scope
 
     async def call_tool(self, source, tool, args):
         self.calls.append((source, tool, args))
@@ -162,7 +195,7 @@ def person_activity(person, day, w=None, **kw):
 
 def test_red_yesterday_counts_six_commits_across_two_repos():
     y = my_day().yesterday
-    assert (y.date, y.commit_count, y.repo_count, y.repos) == (YESTERDAY, 6, 2, [RG, UI])
+    assert (y.date, y.commit_count, y.repo_count, y.repos) == (YESTERDAY, 6, 2, sorted([RG, UI]))
     assert len(y.activity_ids) == len(set(y.activity_ids)) == 6
     assert all(evidence.parse(i)[:2] == ("github", "commit") for i in y.activity_ids)
 
@@ -227,7 +260,8 @@ def test_empty_day_is_empty_lists_not_an_error():
 
 def test_person_activity_covers_every_kind_in_order():
     out = person_activity("dev", TODAY)
-    assert (out.person, out.date, out.timezone) == ("dev", TODAY, "UTC")
+    assert (out.person, out.date, out.timezone, out.github_scope, out.incomplete) == (
+        "dev", TODAY, "UTC", [LOGIN, "private-org"], [])
     assert [(a.action, a.activity_id, a.detail) for a in out.activities] == [
         ("commit", "github:commit:%s@%040x" % (RG, 9), None),
         ("review", "github:review:octo-dev/sandbox#13/4779069846", "COMMENTED"),
@@ -251,6 +285,7 @@ def test_person_with_only_a_github_identity_skips_linear():
 def test_my_day_focus_and_needs_attention():
     d = my_day()
     assert (d.me, d.date, d.timezone) == (Actor("github", LOGIN, person="dev", identity="mapped"), TODAY, "UTC")
+    assert d.incomplete == []
     [f] = d.focus  # the only Urgent issue; HAR-9 (High) and HAR-8 (Medium) wait
     assert (f.activity_id, f.record.title, f.priority) == ("linear:issue:HAR-7", "UI Critic Phase 3", "Urgent")
     assert f.blocked_by == ["linear:issue:HAR-6"]  # HAR-5 is done
@@ -279,6 +314,79 @@ def test_upstream_failure_is_structured_even_inside_a_fan_out(source, tool):
     assert (e.value.code, e.value.data["kind"]) == (-32009, "upstream_error")
 
 
+# ---- review fixes: commit coverage, GitHub scope as a permission, pagination ----
+
+def test_unmerged_feature_branch_commits_count_once():
+    ids = my_day().yesterday.activity_ids
+    assert "github:commit:%s@%040x" % (RG, 3) in ids  # only on feat/x
+    assert ids.count("github:commit:%s@%040x" % (RG, 0)) == 1  # on main and feat/x
+
+
+def test_red_org_repos_are_never_read_without_permission():
+    gw = FakeGateway(world(), scope=())
+    d = run(semantic.my_day(gw, {}))
+    assert (d.github_scope, d.yesterday.commit_count, d.yesterday.repos) == ([LOGIN], 4, [RG])
+    assert all("private-org" not in json.dumps(args) for _, _, args in gw.calls)  # not fetched, not even searched for
+    assert "private-org" not in json.dumps(dataclasses.asdict(d))  # and not shown
+    assert d.focus[0].blocking_prs == []  # PR #9 is in private-org
+    assert [(g.reason, g.detail) for g in d.incomplete] == [
+        ("out_of_scope", "HAR-7: 1 linked PR(s) outside the GitHub scope were not read")]
+
+
+def test_search_results_outside_the_scope_are_dropped():
+    w = world()  # a search that ignores its qualifiers still can't widen the scope
+    w["github"]["search_repositories"] = lambda a: search_page([{"full_name": RG}, {"full_name": UI}], a)
+    gw = FakeGateway(w, scope=())
+    assert run(semantic.my_day(gw, {})).yesterday.repos == [RG]
+    assert not [args for _, tool, args in gw.calls if args.get("owner") == "private-org"]
+
+
+@pytest.mark.parametrize("value, scope", [("", ()), (" private-org , octo-dev/sandbox ", ("private-org", "octo-dev/sandbox"))])
+def test_scope_config(value, scope):
+    assert semantic.load_scope({"RESEAU_GITHUB_SCOPE": value}) == scope
+
+
+@pytest.mark.parametrize("value", ["private-org/app/x", "user:private-org", "private-org app"])
+def test_scope_config_rejects_malformed_entries(value):
+    with pytest.raises(ValueError, match="RESEAU_GITHUB_SCOPE"):
+        semantic.load_scope({"RESEAU_GITHUB_SCOPE": value})
+
+
+def many_commits(n):
+    w = world()
+    found = [commit(RG, 1000 + k, "2026-09-26T12:00:%02dZ" % (k % 60)) for k in range(n)]
+    w["github"]["list_commits"] = lambda a: gh_page(found if (a["repo"], a["sha"]) == ("reseau_graph8", "main") else [], a)
+    return w
+
+
+def test_red_pagination_counts_all_101_commits():
+    d = my_day(many_commits(101))
+    assert (d.yesterday.commit_count, d.incomplete) == (101, [])
+
+
+def test_page_limit_is_reported_not_silent(monkeypatch):
+    monkeypatch.setattr(semantic, "MAX_PAGES", 1)
+    d = my_day(many_commits(101))
+    assert d.yesterday.commit_count == 100
+    [gap] = d.incomplete
+    assert (gap.source, gap.tool, gap.reason) == ("github", "list_commits", "page_limit")
+    assert "reseau_graph8" in gap.detail and "'sha': 'main'" in gap.detail
+
+
+def test_focus_reads_every_page_of_issues():
+    w = world()  # the only Urgent issue comes after 150 Low ones
+    low = [listed("HAR-%d" % (200 + k), "Chore", 4, "Low", "started", "2026-09-26T12:00:00Z") for k in range(150)]
+    urgent = listed("HAR-7", "UI Critic Phase 3", 1, "Urgent", "started", "2026-09-20T00:00:00Z")
+    w["linear"]["list_issues"] = lambda a: linear_page(low + [urgent] if a.get("state") == "started" else [], a)
+    assert [f.activity_id for f in my_day(w).focus] == ["linear:issue:HAR-7"]
+
+
+def test_search_github_marks_incomplete_is_reported():
+    w = world()
+    w["github"]["search_pull_requests"] = lambda a: {"incomplete_results": True, "items": []}
+    assert {(g.tool, g.reason) for g in my_day(w).incomplete} == {("search_pull_requests", "search_incomplete")}
+
+
 # ---- integration: both tools over MCP, through the gateway, against scripted mock upstreams ----
 
 def test_green_both_tools_over_mcp_return_schema_valid_output():
@@ -292,13 +400,14 @@ def test_green_both_tools_over_mcp_return_schema_valid_output():
                 return tools, (await c.call_tool("get_person_activity", {"person": "dev", "date": TODAY}),
                                await c.call_tool("get_my_day_context", {}))
 
-        tools, results = run(serving((gh, lin), body, identities=PEOPLE))
+        tools, results = run(serving((gh, lin), body, identities=PEOPLE, env={"RESEAU_GITHUB_SCOPE": "private-org"}))
 
     for name, res in zip(("get_person_activity", "get_my_day_context"), results):
         assert not res.is_error
         jsonschema.validate(res.structured_content, tools[name].output_schema)
     activity, day = (r.structured_content for r in results)
     assert len(activity["activities"]) == 8
+    assert (activity["github_scope"], activity["incomplete"], day["incomplete"]) == ([LOGIN, "private-org"], [], [])
     assert (day["yesterday"]["commit_count"], day["yesterday"]["repo_count"]) == (6, 2)
     assert day["focus"][0]["blocking_prs"][0]["activity_id"] == "github:pr:%s#9" % UI
     assert len(day["needs_attention"][0]["unresolved"]) == 2

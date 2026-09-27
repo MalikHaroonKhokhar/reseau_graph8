@@ -68,8 +68,8 @@ def review_by_id(page, fields, fetched_at):
     return next((review(r, fields, fetched_at) for r in page if str(r.get("id")) == fields["review_id"]), None)
 
 
-def review_next(page, args):
-    """get_reviews pages by number; a full page means there may be another."""
+def next_page(page, args):
+    """Numbered pages (get_reviews, list_commits, search items): a full page means there may be another."""
     return dict(args, page=args.get("page", 1) + 1) if len(page) == args["perPage"] else None
 
 
@@ -87,5 +87,5 @@ KINDS = {
                            review_comment, review_comment_next),
     "review": Kind(REPO + r"#(?P<number>\d+)/(?P<review_id>\d+)", "{owner}/{repo}#{number}/{review_id}",
                    "pull_request_read", lambda f: dict(_pr_args("get_reviews")(f), perPage=PER_PAGE),
-                   review_by_id, review_next),
+                   review_by_id, next_page),
 }
