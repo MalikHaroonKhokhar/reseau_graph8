@@ -122,6 +122,12 @@ cp .env.example .env   # then fill it in
 ## Run
 
 ```sh
+./run.sh    # gateway on 8080, its tunnel, and the dashboard on http://127.0.0.1:8081; Ctrl-C stops all three
+```
+
+It loads `.env` and refuses to start if 8080 or 8081 is already taken. To run the parts separately:
+
+```sh
 set -a; . ./.env; set +a
 uv run python -m reseau.front --port 8080        # binds 127.0.0.1
 ```
@@ -183,7 +189,7 @@ refused with a `WorkflowError`.
 
 ## Dashboard
 
-With the gateway, the tunnel and the workflows set up (above), in a third shell:
+`./run.sh` starts it. On its own, with the gateway, the tunnel and the workflows set up (above), in a third shell:
 
 ```sh
 set -a; . ./.env; set +a
@@ -260,5 +266,6 @@ creates them and deletes them afterwards, unless `--keep`. It is billable (~150 
 | `reseau/verify.py` | The verifiers every workflow reply passes: citations, counts, blockers |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `reseau/tunnel.py` | The localhost.run tunnel, kept open and followed by the Graph8 registration |
+| `run.sh` | Starts the gateway, the tunnel and the dashboard together |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |
 | `upstream/` | Fixes proposed to Graph8, handed off as tickets (tests: `uv run pytest upstream/<name>`) |
