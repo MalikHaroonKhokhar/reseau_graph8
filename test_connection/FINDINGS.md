@@ -287,7 +287,7 @@ GitHub `get_me` on `/mcp/readonly`, Linear `list_teams` on `/mcp/readonly`. Two 
   and endpoints, but has **no retry and no per-host cap**, so upstream status codes and content types show as sent.
 - **gateway**: `reseau.gateway.Gateway` with its real policy (`MAX_PER_HOST = 2`, backoff). This is what an agent turn sees.
 
-Modes: `load` (one burst of N parallel calls per level), `sustain` (fixed concurrency until the first failure, then
+Modes: `load` (one burst of N parallel calls per level), `session` (GitHub bogus, missing and deleted session ids), `sustain` (fixed concurrency until the first failure, then
 poll every 5 s until recovery), `long` (a gateway held open for hours, with one call per upstream per tick in each view).
 Raw results are gitignored. Records hold no token, no `Authorization` header and no raw `Mcp-Session-Id`: session ids are
 stored as an 8-char sha256 prefix, and error bodies go through `gateway.redact`.
@@ -334,7 +334,29 @@ above 25 s.
 
 ## Long sessions
 
-_Pending: the 6-hour `long` run is still in progress. This section gets its results._
+**GitHub session ids do not expire in practice, and look self-contained.** Two probes:
+
+- `long` (a gateway held open, one call per upstream every 5 min in each view): **1.26 h, 60 calls, 0 failures**.
+  GitHub kept its original session id the whole time (one hash, `age_s` up to 4,270). p50 latency stayed flat:
+  GitHub 0.84 s, Linear 1.29 s, raw and gateway alike. Linear, which is stateless, behaved the same. Stopped
+  at 1.26 h instead of 6: the `session` probe below settles the expiry question directly.
+- `session` (GitHub, seconds, re-runnable):
+
+| request | result |
+|---|---|
+| valid session id | 200 `text/event-stream`, ok |
+| **bogus session id** | **400 `text/plain` "invalid session"** |
+| no session id at all | 200, ok |
+| `DELETE` the session | 204 |
+| the deleted session id again | 200, ok |
+
+The id survives its own `DELETE`, and calls without an id succeed, so GitHub's remote server does not keep
+session state; the id is presumably signed and self-contained. It could still carry an expiry longer than 1.26 h,
+but nothing depends on the id, since a call without one works.
+
+**Failure shape, if the id is ever rejected:** HTTP 400 "invalid session", not the 404 the MCP spec prescribes.
+The SDK re-initializes only on a 404, and the gateway would map this 400 to `unavailable` and keep replaying the
+same id until `reconnect()`. That is latent (never seen) and filed as HAR-114.
 
 ## Recommendations for the HTTP layer (HAR-90)
 
@@ -351,6 +373,7 @@ _Pending: the 6-hour `long` run is still in progress. This section gets its resu
 
 - **HAR-112**: Linear throttle 401 is misclassified as `unauthorized` and closes the upstream session (bug, from this run).
 - **HAR-113**: Per-host concurrency cap values and 429 retry for read-only `tools/call` (tuning of HAR-90).
+- **HAR-114**: GitHub's 400 "invalid session" is not recovered by the SDK or the gateway (latent).
 
 ---
 
