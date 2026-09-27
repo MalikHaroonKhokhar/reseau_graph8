@@ -101,6 +101,10 @@ DECLINE = "No evidence found."
 # The voice agent's canned reply when Graph8 can't run its model (live 2026-09-27, in place of any JSON): an outage on
 # Graph8's side, not a reply that got the facts wrong.
 GRAPH8_DOWN = "respond right now due to a temporary issue"
+# The agent nodes' model override: OpenAI, which Graph8 asked for while its Anthropic path failed (2026-09-27: the
+# canned reply above with 0 tokens, and "Could not connect to Weaviate"). Graph8's other routes take gpt-4o or
+# gpt-4o-mini for OpenAI.
+MODEL = "gpt-4o"
 # The tools Ask Réseau can reach, each through its own answer workflow: the semantic tools and get_evidence. The
 # gateway's raw github_*, linear_* and g8_* tools are left out (deck slide 7).
 ASK_TOOLS = {t.name: t for t in [*semantic.TOOLS, evidence.TOOL]}
@@ -201,7 +205,7 @@ def tool_node(server_id, node, tool, inputs):
 
 def agent_node(agent_id, instructions, message):
     return {"node_id": "agent_1", "name": "agent_1", "node_type": "agent",
-            "config": {"agent_id": agent_id, "instructions": instructions,
+            "config": {"agent_id": agent_id, "instructions": instructions, "model": MODEL,
                        "input_mappings": [{"source_expression": message, "target_field": "message"}]}}
 
 
