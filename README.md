@@ -74,6 +74,17 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   the tool's count, and the line must cite every activity_id behind it. Each blocked issue gets a line that
   names and cites its blocker. A day with no activity is a report that says "Nothing to report." in every
   section.
+- **Ask Réseau: questions answered with their sources, or declined.** A Graph8 agent reads a free-text
+  question and picks one of the semantic tools and its arguments: `get_person_activity`, `get_project_context`,
+  `get_team_summary`, `get_evidence`, `get_my_day_context` or `get_business_context`. The raw `github_*`,
+  `linear_*` and `g8_*` tools are never offered, and a route to one is refused before anything runs. That tool's
+  workflow runs, and a second agent answers in one to five sentences. The answer comes back only if every
+  sentence cites activity_ids the tool returned and every number in it appears in that output. When the tool
+  returned linked Graph8 records, the answer must cite at least one. A question no tool covers (the weather,
+  revenue, anyone not in the identity map), or one the output doesn't answer, gets "No evidence found."
+  Graph8 can't pick the tool inside a single workflow: a tool node's `mcp_tool_name` isn't interpolated (live,
+  2026-09-27), and the agent node can't call MCP tools (HAR-91). So the router is a workflow of its own, and
+  each semantic tool has an answer workflow. A question costs two agent runs.
 - **Checks catch numbers and citations, not meaning.** A summary sentence can cite real IDs and state real
   counts and still add a judgment ("a strong day"). The prompts forbid judgments, causes and claims about what
   didn't happen, and live runs follow them, but no check enforces it.
@@ -100,6 +111,7 @@ cp .env.example .env   # then fill it in
 | `RESEAU_GATEWAY_TOKEN` | Secret Graph8 uses to reach the gateway. Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Comma-separate several to rotate. |
 | `RESEAU_START_MY_DAY` | The Start My Day workflow's `action_id`, printed by `python -m reseau.workflows setup`. |
 | `RESEAU_DAILY_REPORT` | The daily report workflow's `action_id`, printed by the same `setup`. |
+| `RESEAU_ASK` | Ask Réseau's workflows, `route=<action_id>,get_person_activity=<action_id>,...`, printed by the same `setup`. |
 
 ## Run
 
@@ -132,15 +144,16 @@ The script counts the gateway's tools itself, registers `https://<host>/g8/<toke
 and checks that Graph8's `/test` returns `success: true` with the same `tools_count`. Without `--keep`, it
 then deletes the record and verifies that it's gone.
 
-## Start My Day and the daily report
+## Start My Day, the daily report and Ask Réseau
 
 With the gateway and `reseau.tunnel` running:
 
 ```sh
-uv run python -m reseau.workflows setup                    # once: the voice agent and both workflows; prints their action_ids
+uv run python -m reseau.workflows setup                    # the voice agent and every workflow not set up yet; prints the env lines
 uv run python -m reseau.workflows update                   # after changing a prompt: Graph8 keeps its own copy
 uv run python -m reseau.workflows start-my-day             # the verified briefing (~12 credits a run)
 uv run python -m reseau.workflows daily-report 2026-09-26  # the verified team report for that day (~12 credits)
+uv run python -m reseau.workflows ask "Why does HAR-104 matter?"  # a verified answer (~24 credits; ~12 to decline)
 uv run python -m reseau.workflows verify <execution_id>    # check any run, e.g. one started in Graph8 (free)
 ```
 
@@ -153,7 +166,14 @@ The dashboard calls `reseau.workflows.start_my_day(g8, action_id)` and gets back
 `{"execution_id", "team", "date", "sections": {"summary" | "completed" | "merged" | "commits" | "blocked": [{"text", "activity_ids"}]}, "unmapped", "incomplete"}`.
 Either raises a `WorkflowError` listing what failed. `unmapped` (team members who aren't counted) and
 `incomplete` (anything that may be missing) come straight from the tool. The verifiers are in
-`reseau/verify.py`: `citations`, `counts`, `numbers` and `blockers`. Ask Réseau will use them too.
+`reseau/verify.py`: `citations`, `counts`, `numbers` and `blockers`.
+
+`reseau.workflows.ask(g8, reseau.workflows.ask_ids(RESEAU_ASK), question)` returns
+`{"question", "tool", "arguments", "execution_ids": {"route", "answer"}, "sections": {"answer": [{"text", "activity_ids"}]}, "incomplete"}`.
+A decline is `[{"text": "No evidence found.", "activity_ids": []}]`, with `tool` `null` when no tool fit. The
+router is told today's date and the names in `RESEAU_IDENTITIES` and `RESEAU_PROJECTS`, read from the
+environment of the process that calls `ask`. A route or answer that fails its check is retried once, then
+refused with a `WorkflowError`.
 
 ## Security
 
@@ -186,6 +206,13 @@ fixtures, 3 times plus once on an empty day, and verifies every reply without re
 `uv run python -m tests.live_workflows https://<public host> [--workflow daily-report]`, with a tunnel open
 to port 8080.
 
+Live check of Ask Réseau: 7 fixed questions about the data behind the running gateway (the Réseau team and
+the Graph8 demo customers of `spikes/graph8_entities/seed_demo.py`), each asked once without retrying. Each
+answer must pass its check and cite what the question needs (the blocker, a Graph8 record, the unlinked
+issue), or decline. With `RESEAU_ASK` set, it pushes this code's prompts onto those workflows. Otherwise it
+creates them and deletes them afterwards, unless `--keep`. It is billable (~150 credits):
+`uv run python -m tests.live_ask [--keep]`, with `reseau.front` and `reseau.tunnel` running.
+
 ## Layout
 
 | Path | Contents |
@@ -195,7 +222,7 @@ to port 8080.
 | `reseau/evidence/` | Normalized records with provenance, activity_ids, identity mapping, `get_evidence`; one normalizer module per source (GitHub, Linear, Graph8) |
 | `reseau/semantic.py` | `get_person_activity`, `get_my_day_context`, `get_project_context`, `get_team_summary` and `get_business_context`: upstream fetching, then pure aggregation over records. The docstring records how "me", dates, issue↔PR links, unresolved threads, projects, blocked issues, team membership and work↔business links are resolved. |
 | `reseau/outbound.py` | Shared HTTP policy: explicit User-Agent, backoff on 429/5xx, per-host concurrency cap |
-| `reseau/workflows.py` | Graph8 workflows: the Start My Day and daily report definitions, prompts and triggers |
+| `reseau/workflows.py` | Graph8 workflows: Start My Day, the daily report and Ask Réseau; definitions, prompts and triggers |
 | `reseau/verify.py` | The verifiers every workflow reply passes: citations, counts, blockers |
 | `reseau/register_graph8.py` | Graph8 registration live check |
 | `reseau/tunnel.py` | The localhost.run tunnel, kept open and followed by the Graph8 registration |

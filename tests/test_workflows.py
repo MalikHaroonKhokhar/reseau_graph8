@@ -58,11 +58,19 @@ def test_setup_creates_the_agent_then_each_workflow_over_the_gateway():
         posted.append((path, body))
         return 201, {"agent": {"agent_id": "agent-1"}} if path.endswith("/agents") else {"action_id": "wf-%d" % len(posted)}
 
-    assert workflows.setup(g8, "srv-1") == ("agent-1", {"RESEAU_START_MY_DAY": "wf-2", "RESEAU_DAILY_REPORT": "wf-3"})
-    assert [p for p, _ in posted] == ["/api/v1/voice/agents", "/api/v1/workflows", "/api/v1/workflows"]
+    agent_id, created = workflows.setup(g8, "srv-1")
+    assert (agent_id, created["RESEAU_START_MY_DAY"], created["RESEAU_DAILY_REPORT"]) == ("agent-1", "wf-2", "wf-3")
+    assert workflows.ask_ids(created["RESEAU_ASK"]) == {k: "wf-%d" % n for n, k in enumerate(workflows.ASK, 4)}
+    assert [p for p, _ in posted] == ["/api/v1/voice/agents"] + ["/api/v1/workflows"] * (2 + len(workflows.ASK))
     assert posted[0][1]["use_company_knowledge"] is False  # no facts from anywhere but the tool
     assert posted[1][1]["config"] == workflows.start_my_day_config("srv-1", "agent-1")
     assert posted[2][1]["config"] == workflows.daily_report_config("srv-1", "agent-1")
+    assert posted[3][1]["config"] == workflows.route_config("srv-1", "agent-1")
+    # set up later, Ask Réseau reuses the existing voice agent
+    posted.clear()
+    agent_id, created = workflows.setup(g8, "srv-1", [workflows.ASK_ENV], "agent-0")
+    assert (agent_id, list(created)) == ("agent-0", ["RESEAU_ASK"]) and len(posted) == len(workflows.ASK)
+    assert all(body["config"]["nodes"][-1]["config"]["agent_id"] == "agent-0" for _, body in posted)
 
 
 # ---- the triggers, over a scripted Graph8 ----
@@ -288,3 +296,9 @@ def test_update_pushes_prompts_onto_the_existing_workflows_and_agent():
                     ("/api/v1/workflows/wf-2", {"name": "reseau-daily-report", "description": "Réseau team daily report (HAR-103)",
                                                 "config": workflows.daily_report_config("srv-1", "agent-1")}),
                     ("/api/v1/voice/agents/agent-1", workflows.AGENT)]
+    calls.clear()
+    ids = {k: "wf-" + k for k in workflows.ASK}
+    workflows.update(g8, "srv-1", {"RESEAU_ASK": ",".join("%s=%s" % kv for kv in ids.items())})
+    puts = [(path, body.get("config")) for method, path, body in calls if method == "PUT"]
+    assert puts[:-1] == [("/api/v1/workflows/" + ids[k], config("srv-1", "agent-1"))
+                         for k, (_, _, config) in workflows.ASK.items()]
