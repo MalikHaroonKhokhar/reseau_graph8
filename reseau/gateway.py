@@ -43,6 +43,7 @@ UNKNOWN_UPSTREAM = -32004
 CONTEXT_NOT_ESTABLISHED = -32005
 UNKNOWN_TOOL = -32006
 TOOL_NOT_ALLOWED = -32007
+OUT_OF_SCOPE = -32012  # after reseau/evidence's and reseau/semantic's codes
 # -32008, -32009, -32010: reseau/evidence (not found, upstream error, search incomplete)
 # -32011: reseau/semantic (unmapped person)
 # Graph8's own JSON-RPC code for "Org context not established for this session. Call g8_current_org first".
@@ -68,17 +69,22 @@ class Upstream:
     # Raw tool names only Réseau's own tools may call (Gateway.call_tool): never listed, never routed for a
     # client. For tools that would widen what a client can reach, e.g. GitHub search across every repo.
     internal: frozenset[str] = frozenset()
+    # A call carrying owner/repo arguments must be inside RESEAU_GITHUB_SCOPE, whoever makes it: a client,
+    # get_evidence or the semantic tools. Checked before the upstream is called.
+    repo_scoped: bool = False
 
 
 # Read-only endpoints (FINDINGS.md: GitHub /mcp/readonly 27 tools, Linear /mcp/readonly 35, no write tools)
 # plus a minimal allowlist for the semantic tools (HAR-100, HAR-101, HAR-109); grow it from those tickets.
-# GitHub's search and branch listing are internal: the semantic tools scope every query to the person's own
-# account plus RESEAU_GITHUB_SCOPE, and a client calling them raw could reach any org repo the token sees.
+# GitHub reads are limited to RESEAU_GITHUB_SCOPE. Every allowlisted tool but get_me takes owner/repo, so the
+# repo_scoped check covers them all; keep it that way. Search takes a free-text query instead, so it is
+# internal: the semantic tools add the scope's qualifiers to every query, and no client can call it.
 DEFAULT_UPSTREAMS = (
     Upstream("github", "https://api.githubcopilot.com/mcp/readonly", "GITHUB_MCP_TOKEN",
              allow=frozenset({"get_me", "list_commits", "get_commit", "list_pull_requests", "pull_request_read",
                               "list_issues", "issue_read"}),
-             internal=frozenset({"search_pull_requests", "search_repositories", "list_branches"})),
+             internal=frozenset({"search_pull_requests", "search_repositories", "list_branches"}),
+             repo_scoped=True),
     Upstream("linear", "https://mcp.linear.app/mcp/readonly", "LINEAR_API_KEY",
              allow=frozenset({"list_teams", "list_issues", "get_issue", "list_comments", "list_projects",
                               "get_project"})),
@@ -445,6 +451,11 @@ class Gateway:
         if not allowed(up, tool) and tool not in up.internal:
             raise UpstreamError(TOOL_NOT_ALLOWED, "%s: tool %r is not allowlisted" % (name, tool), name, "tool_not_allowed")
         args = arguments or {}
+        if up.repo_scoped and "owner" in args and not semantic.in_scope(self.github_scope, args["owner"],
+                                                                        args.get("repo")):
+            raise UpstreamError(OUT_OF_SCOPE, "%s: %s%s is outside %s" % (
+                name, args["owner"], "/%s" % args["repo"] if "repo" in args else "", semantic.SCOPE_ENV),
+                name, "out_of_scope")
 
         async def establish(client, stale_gen):
             """Bootstrap unless another caller already did since stale_gen: concurrent callers share one call."""

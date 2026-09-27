@@ -563,4 +563,5 @@ def test_default_config_is_read_only_and_allowlisted():
     assert ups["github"].url.endswith("/mcp/readonly") and ups["linear"].url.endswith("/mcp/readonly")
     assert all(u.allow is not None for u in DEFAULT_UPSTREAMS)
     assert not ups["github"].allow & {"search_pull_requests", "search_repositories", "list_branches"}
+    assert ups["github"].repo_scoped and not ups["linear"].repo_scoped
     assert ups["graph8"].bootstrap_tool in ups["graph8"].allow

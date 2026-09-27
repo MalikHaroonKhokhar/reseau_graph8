@@ -18,10 +18,11 @@ The ticket's open assumptions, checked against the live upstreams on 2026-09-27:
   2026-08-05). So commits come from list_commits on every branch of every in-scope repo pushed since the day
   began, unmerged feature branches included, deduplicated by SHA. A commit belongs to the day it was
   committed.
-- GitHub scope is a permission: the tools read only the person's own account plus the owners and repos
-  listed in RESEAU_GITHUB_SCOPE. Every search carries those qualifiers and results are rechecked against
-  them, so an org's repos are never read until the org is listed. A Linear-linked PR outside the scope is
-  not read either; incomplete says one was skipped, without naming its repo.
+- GitHub scope is a permission: RESEAU_GITHUB_SCOPE is the complete list of owners and repos any GitHub
+  read may touch (the gateway enforces it for raw tools and get_evidence too). Unset, no repo is read.
+  Every search carries the scope's qualifiers and results are rechecked against it, and an empty scope
+  never searches. A Linear-linked PR outside the scope is not read; incomplete says one was skipped,
+  without naming its repo.
 - Nothing is dropped silently: every listing follows its pages up to a safety limit, and each answer's
   incomplete names every listing that stopped with pages left or that GitHub marked incomplete.
 - Linear moves: stateHistory records when an issue changed state, not who changed it. A person's moves are
@@ -85,7 +86,7 @@ class PersonActivity:
     person: str
     date: str
     timezone: str
-    github_scope: list[str]  # the GitHub owners and repos read: the person's account, then RESEAU_GITHUB_SCOPE
+    github_scope: list[str]  # the GitHub owners and repos that may be read: RESEAU_GITHUB_SCOPE
     activities: list[Activity]  # oldest first
     incomplete: list[Gap]
 
@@ -169,13 +170,20 @@ def load_tz(env=os.environ):
 
 
 def load_scope(env=os.environ):
-    """RESEAU_GITHUB_SCOPE: comma-separated owners (users or orgs) and owner/repo entries the semantic tools
-    may read besides the person's own account. Unset = nothing else."""
+    """RESEAU_GITHUB_SCOPE: comma-separated owners (users or orgs) and owner/repo entries; the complete list
+    of what GitHub reads may touch. Unset = nothing."""
     entries = [e.strip() for e in (env.get(SCOPE_ENV) or "").split(",") if e.strip()]
     bad = [e for e in entries if not SCOPE_ENTRY.fullmatch(e)]
     if bad:
         raise ValueError("%s: not an owner or owner/repo: %s" % (SCOPE_ENV, ", ".join(bad)))
     return tuple(entries)
+
+
+def in_scope(scope, owner, repo=None):
+    """An owner entry covers all of that owner's repos; an owner/repo entry covers that one repo."""
+    owner = str(owner).casefold()
+    full = "%s/%s" % (owner, str(repo).casefold()) if repo is not None else None
+    return any(e.casefold() in (owner, full) for e in scope)
 
 
 def now():
@@ -219,8 +227,8 @@ def repo_args(full):
 
 class Upstreams:
     """The upstream questions behind the tools, answered with normalized records. call_tool is
-    Gateway.call_tool, so the allowlist and redaction apply. Independent calls run concurrently. GitHub reads
-    stay inside scope (the person's login, then RESEAU_GITHUB_SCOPE); gaps collects what may be missing."""
+    Gateway.call_tool, so the allowlist, the GitHub scope and redaction apply. Independent calls run
+    concurrently. GitHub reads stay inside scope (RESEAU_GITHUB_SCOPE); gaps collects what may be missing."""
 
     def __init__(self, call_tool, index, at, scope):
         self.call, self.index, self.at = call_tool, index, at.isoformat(timespec="seconds")
@@ -233,8 +241,7 @@ class Upstreams:
         return evidence.resolve(normalize(payload, {}, self.at), self.index)
 
     def in_scope(self, full):
-        owner, full = full.split("/")[0].casefold(), full.casefold()
-        return any(e.casefold() in (owner, full) for e in self.scope)
+        return in_scope(self.scope, *full.split("/"))
 
     async def collect(self, source, tool, args, items, advance, limit=None):
         """Every page of a listing, up to a safety limit of pages; stopping with pages left adds a gap."""
@@ -259,7 +266,10 @@ class Upstreams:
 
     async def search(self, tool, query):
         """A GitHub search inside the scope: GitHub ORs the user:/repo: qualifiers, and every result is
-        rechecked, so nothing outside the scope is ever returned."""
+        rechecked, so nothing outside the scope is ever returned. An empty scope never searches: without a
+        user:/repo: qualifier GitHub would search every repo the token sees."""
+        if not self.scope:
+            return []
         query = " ".join([query] + [("repo:" if "/" in e else "user:") + e for e in self.scope])
 
         def items(page):
@@ -431,7 +441,7 @@ async def person_activity(gw, args):
         raise error(UNMAPPED_PERSON, "unmapped_person", "%r is not in the identity map (%s)"
                     % (person, evidence.IDENTITIES_ENV), person=person)
     start, end = day_window(day, gw.tz)
-    scope = [ids["github"], *gw.github_scope] if "github" in ids else []
+    scope = list(gw.github_scope) if "github" in ids else []
     up = Upstreams(gw.call_tool, gw.identities, now(), scope)
     calls = []
     if "github" in ids:
@@ -447,7 +457,7 @@ async def person_activity(gw, args):
 async def my_day(gw, args):
     at = now()
     login = (await evidence.fetch_json(gw.call_tool, "github", "get_me", {}))["login"]
-    up = Upstreams(gw.call_tool, gw.identities, at, [login, *gw.github_scope])
+    up = Upstreams(gw.call_tool, gw.identities, at, gw.github_scope)
     today = at.astimezone(gw.tz).date()
     yesterday = today - timedelta(days=1)
     start, end = day_window(yesterday, gw.tz)

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import re
 from datetime import datetime, timezone
@@ -217,6 +218,30 @@ def test_green_get_evidence_resolves_all_four_kinds(gateway_up):
         assert datetime.fromisoformat(r["fetched_at"]).tzinfo is not None
     assert [(r["actor"]["person"], r["actor"]["identity"]) for r in recs] == [
         ("dev", "mapped"), ("dev", "mapped"), (None, "unmapped"), ("dev", "mapped")]
+
+
+def test_red_github_scope_blocks_raw_tools_and_evidence_before_the_upstream(gateway_up):
+    gh = dataclasses.replace(gateway_up[0], repo_scoped=True)
+    env = dict(ENV, RESEAU_GITHUB_SCOPE="octo-dev")
+    out_of_scope = {"method": "get", "owner": "modelcontextprotocol", "repo": "python-sdk", "pullNumber": 3583}
+
+    async def go():
+        async with Gateway([gh, gateway_up[1]], env, identities=PEOPLE) as gw:
+            ok = (await gw.call("get_evidence", {"activity_id": PR_ID})).structured_content
+            errors = []
+            for call in (gw.call("github_pull_request_read", out_of_scope),
+                         gw.call("get_evidence", {"activity_id": COMMENT_ID}),
+                         gw.call("github_get_commit", {"owner": "OCTO-DEV-2", "repo": "x", "sha": "abc1234"})):
+                with pytest.raises(MCPError) as e:
+                    await call
+                errors.append(e.value)
+            linear = (await gw.call("get_evidence", {"activity_id": ISSUE_ID})).structured_content  # not GitHub
+            return ok, errors, linear
+
+    ok, errors, linear = run(go())
+    assert ok["activity_id"] == PR_ID and linear["activity_id"] == ISSUE_ID
+    assert [(e.code, e.data["kind"]) for e in errors] == [(-32012, "out_of_scope")] * 3
+    assert "modelcontextprotocol/python-sdk is outside RESEAU_GITHUB_SCOPE" in errors[0].message
 
 
 @pytest.mark.parametrize("aid", ["github:pr:octo-dev/reseau_graph8#9", "github:commit:octo-dev/reseau_graph8@deadbeef",

@@ -25,7 +25,7 @@ NOW = datetime(2026, 9, 27, 9, tzinfo=timezone.utc)
 TODAY, YESTERDAY = "2026-09-27", "2026-09-26"
 LOGIN, LINEAR_ID = PEOPLE["dev"]["github"], PEOPLE["dev"]["linear"]
 RG, UI = "octo-dev/reseau_graph8", "private-org/ui-critic"  # UI is an org repo: read only once "private-org" is in scope
-SCOPE = ("private-org",)
+SCOPE = (LOGIN, "private-org")
 
 
 # ---- the scripted world: what GitHub and Linear answer, in their recorded shapes ----
@@ -323,7 +323,7 @@ def test_unmerged_feature_branch_commits_count_once():
 
 
 def test_red_org_repos_are_never_read_without_permission():
-    gw = FakeGateway(world(), scope=())
+    gw = FakeGateway(world(), scope=(LOGIN,))
     d = run(semantic.my_day(gw, {}))
     assert (d.github_scope, d.yesterday.commit_count, d.yesterday.repos) == ([LOGIN], 4, [RG])
     assert all("private-org" not in json.dumps(args) for _, _, args in gw.calls)  # not fetched, not even searched for
@@ -336,9 +336,24 @@ def test_red_org_repos_are_never_read_without_permission():
 def test_search_results_outside_the_scope_are_dropped():
     w = world()  # a search that ignores its qualifiers still can't widen the scope
     w["github"]["search_repositories"] = lambda a: search_page([{"full_name": RG}, {"full_name": UI}], a)
-    gw = FakeGateway(w, scope=())
+    gw = FakeGateway(w, scope=(LOGIN,))
     assert run(semantic.my_day(gw, {})).yesterday.repos == [RG]
     assert not [args for _, tool, args in gw.calls if args.get("owner") == "private-org"]
+
+
+def test_empty_scope_reads_no_github_repo():
+    gw = FakeGateway(world(), scope=())
+    d = run(semantic.my_day(gw, {}))
+    assert (d.github_scope, d.needs_attention, d.yesterday.commit_count) == ([], [], 0)
+    assert [tool for source, tool, _ in gw.calls if source == "github"] == ["get_me"]  # never an unscoped search
+
+
+@pytest.mark.parametrize("scope, owner, repo, ok", [
+    ((LOGIN,), "Octo-Dev", "anything", True), ((LOGIN,), "private-org", "ui-critic", False),
+    (("private-org/ui-critic",), "private-org", "ui-critic", True), (("private-org/ui-critic",), "private-org", "x", False),
+    (("private-org/ui-critic",), "private-org", None, False), ((), LOGIN, "reseau_graph8", False)])
+def test_in_scope(scope, owner, repo, ok):
+    assert semantic.in_scope(scope, owner, repo) is ok
 
 
 @pytest.mark.parametrize("value, scope", [("", ()), (" private-org , octo-dev/sandbox ", ("private-org", "octo-dev/sandbox"))])
@@ -400,7 +415,8 @@ def test_green_both_tools_over_mcp_return_schema_valid_output():
                 return tools, (await c.call_tool("get_person_activity", {"person": "dev", "date": TODAY}),
                                await c.call_tool("get_my_day_context", {}))
 
-        tools, results = run(serving((gh, lin), body, identities=PEOPLE, env={"RESEAU_GITHUB_SCOPE": "private-org"}))
+        tools, results = run(serving((gh, lin), body, identities=PEOPLE,
+                                     env={"RESEAU_GITHUB_SCOPE": "%s,private-org" % LOGIN}))
 
     for name, res in zip(("get_person_activity", "get_my_day_context"), results):
         assert not res.is_error

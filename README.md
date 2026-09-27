@@ -32,9 +32,11 @@ Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + B
   structured facts, not prose, and every fact carries the activity_ids `get_evidence` resolves. Commits come
   from every branch, unmerged feature branches included. Every listing is paged through; anything cut off by
   a safety limit is named in the answer's `incomplete`, never dropped silently.
-- **GitHub scope is a permission.** The semantic tools read only a person's own GitHub account plus what
-  `RESEAU_GITHUB_SCOPE` lists, and never read or show an org's repos until you add the org. GitHub search,
-  which could reach any repo the token sees, is internal to these tools and is not exposed to clients.
+- **GitHub scope is a permission.** `RESEAU_GITHUB_SCOPE` is the complete list of GitHub owners and repos
+  the gateway may read: the raw `github_*` tools, `get_evidence` and the semantic tools alike. A call for
+  any other repo is refused before it reaches GitHub (`-32012 out_of_scope`), and an org's repos are never
+  read or shown until the org is listed. GitHub search, which could reach any repo the token sees, is
+  internal to the semantic tools, which add the scope to every query; clients can't call it.
 
 ## Setup
 
@@ -51,7 +53,7 @@ cp .env.example .env   # then fill it in
 | `LINEAR_API_KEY` | Linear API key (`lin_api_…`) |
 | `GRAPH8_API_KEY` | Graph8 org API key (`g8_live_…`). Used as an upstream and by the registration script. |
 | `RESEAU_IDENTITIES` | Optional. Path to a JSON map of people to their upstream IDs, e.g. `{"ana": {"github": "ana-gh", "linear": "<Linear user id>"}}`. Actors not in the map are reported as `unmapped`, never guessed. `get_person_activity` only accepts people in this map. |
-| `RESEAU_GITHUB_SCOPE` | Optional. Comma-separated GitHub owners (users or orgs) and `owner/repo` entries the semantic tools may read besides each person's own account, e.g. `acme,other-org/app`. Unset means own accounts only. |
+| `RESEAU_GITHUB_SCOPE` | Comma-separated GitHub owners (users or orgs) and `owner/repo` entries: everything the gateway may read on GitHub, e.g. `ana-gh,acme/app`. An owner entry covers only repos that account owns, not the orgs it belongs to. Unset means no GitHub repo is read. |
 | `RESEAU_TIMEZONE` | Optional. IANA timezone (e.g. `Asia/Karachi`) that sets where a day starts for `get_person_activity`'s date and for "yesterday". Default `UTC`. |
 | `RESEAU_GATEWAY_TOKEN` | Secret Graph8 uses to reach the gateway. Generate it with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Comma-separate several to rotate. |
 
