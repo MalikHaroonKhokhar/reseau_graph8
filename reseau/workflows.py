@@ -98,6 +98,9 @@ Never write an id that is not in the JSON.
 - Plain sentences: no greetings, sign-offs, headings, markdown, dates, or activity_ids inside text."""
 
 DECLINE = "No evidence found."
+# The voice agent's canned reply when Graph8 can't run its model (live 2026-09-27, in place of any JSON): an outage on
+# Graph8's side, not a reply that got the facts wrong.
+GRAPH8_DOWN = "respond right now due to a temporary issue"
 # The tools Ask Réseau can reach, each through its own answer workflow: the semantic tools and get_evidence. The
 # gateway's raw github_*, linear_* and g8_* tools are left out (deck slide 7).
 ASK_TOOLS = {t.name: t for t in [*semantic.TOOLS, evidence.TOOL]}
@@ -165,9 +168,11 @@ AGENT = {"entity_type": "agent", "agent_status": "inactive", "role": "Assistant"
 
 
 class WorkflowError(Exception):
-    def __init__(self, message, problems=()):
+    """problems: why the reply failed verification. upstream: the provider that was down, when that's the cause."""
+
+    def __init__(self, message, problems=(), upstream=None):
         super().__init__(message)
-        self.problems = list(problems)
+        self.problems, self.upstream = list(problems), upstream
 
 
 # ---- the workflows ----
@@ -329,6 +334,9 @@ def verified(once, attempts):
         execution, output, reply, sections, problems = once()
         if not problems:
             return execution, output, sections
+    if GRAPH8_DOWN in str(reply):
+        raise WorkflowError("execution %s: Graph8's agent is unavailable: %r" % (execution, str(reply)[:200]), problems,
+                            "graph8")
     raise WorkflowError("execution %s: the reply failed verification: %r" % (execution, str(reply)[:500]), problems)
 
 
@@ -420,11 +428,11 @@ def report_once(g8, action_id, day):
 
 def start_my_day(g8, action_id, attempts=2):
     """The dashboard's trigger: run Start My Day and return its verified briefing,
-    {"execution_id", "date", "sections": {section: [{"text", "activity_ids"}]}, "incomplete"}. incomplete is the
-    tool's own list of what may be missing, passed through untouched. A reply that fails verification is
-    retried; if every attempt fails, WorkflowError carries the last one's problems."""
+    {"execution_id", "date", "me", "sections": {section: [{"text", "activity_ids"}]}, "incomplete"}. me (whose day
+    it is) and incomplete (what may be missing) are the tool's own, passed through untouched. A reply that fails
+    verification is retried; if every attempt fails, WorkflowError carries the last one's problems."""
     execution, context, briefing = verified(partial(my_day_once, g8, action_id), attempts)
-    return {"execution_id": execution, "date": context.get("date"), "sections": briefing,
+    return {"execution_id": execution, "date": context.get("date"), "me": context.get("me"), "sections": briefing,
             "incomplete": context.get("incomplete") or []}
 
 
