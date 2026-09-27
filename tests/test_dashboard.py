@@ -194,3 +194,30 @@ def test_the_page_is_served():
     assert page.headers["content-type"].startswith("text/html") and "Start My Day" in page.text
     assert c.get("/app.js").status_code == 200 and c.get("/app.css").status_code == 200
     assert pathlib.Path(dashboard.STATIC / "index.html").read_text() == page.text
+
+
+# ---- deployed: dashboard.public ----
+
+RENDER = {"GRAPH8_API_KEY": SECRET, "RESEAU_DASHBOARD_PASSWORD": "pw-" + "x" * 16,
+          "RENDER_EXTERNAL_HOSTNAME": "reseau-gateway.onrender.com"}
+
+
+def test_public_refuses_to_start_without_a_password(monkeypatch):
+    monkeypatch.setattr(gateway, "SECRETS", set(gateway.SECRETS))
+    with pytest.raises(SystemExit, match="RESEAU_DASHBOARD_PASSWORD"):
+        dashboard.public(None, dict(RENDER, RESEAU_DASHBOARD_PASSWORD="short"))
+
+
+def test_public_asks_for_the_password_and_answers_render_host(monkeypatch):
+    monkeypatch.setattr(gateway, "SECRETS", set(gateway.SECRETS))
+    http = TestClient(dashboard.public(None, RENDER), base_url="https://reseau-gateway.onrender.com")
+    anon = http.get("/")
+    assert anon.status_code == 401 and anon.headers["www-authenticate"].startswith("Basic ")
+    assert http.post("/api/start-my-day", json={}).status_code == 401  # no billable run without it
+    assert http.get("/", auth=("demo", "wrong-password-123")).status_code == 401
+    assert http.get("/", headers={"Authorization": "Basic %%%"}).status_code == 401
+    page = http.get("/", auth=("anyone", RENDER["RESEAU_DASHBOARD_PASSWORD"]))
+    assert page.status_code == 200 and "<html" in page.text.lower()
+    other = TestClient(dashboard.public(None, RENDER), base_url="https://reseau.attacker.example")
+    assert other.get("/", auth=("anyone", RENDER["RESEAU_DASHBOARD_PASSWORD"])).status_code == 400
+    assert RENDER["RESEAU_DASHBOARD_PASSWORD"] in gateway.SECRETS  # redacted from every log line and response

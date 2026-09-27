@@ -122,3 +122,13 @@ def test_load_tokens_refuses_missing_or_weak(value):
 def test_load_tokens_splits():
     assert front.load_tokens({front.TOKEN_ENV: " %s , %s " % (TOK, TOK2)}) == [TOK, TOK2]
     assert front.valid(TOK2, [TOK, TOK2]) and not front.valid(TOK[:-1], [TOK, TOK2])
+
+
+def test_with_a_site_every_path_outside_g8_goes_to_it():
+    async def site(scope, receive, send):
+        await front.Response("site:" + scope["path"])(scope, receive, send)
+
+    from starlette.testclient import TestClient
+    http = TestClient(front.app(None, [TOK], site))
+    got = [(r.status_code, r.text) for r in (http.get(p) for p in ("/ping", "/", "/api/evidence", "/g8", "/g8/x/sse"))]
+    assert got == [(200, "ok"), (200, "site:/"), (200, "site:/api/evidence"), (404, "Not Found"), (404, "Not Found")]

@@ -147,23 +147,25 @@ tunnel, moves the same registration to each new host (so every workflow keeps wo
 
 ## Deploy (Render)
 
-The gateway runs on Render's free plan from `render.yaml` and the `Dockerfile` (the gateway only; the dashboard
-stays local). It needs a long-lived process: the SSE session lives in memory, so serverless hosts like Vercel
-can't run it.
+The gateway and the dashboard run as one service on Render's free plan, from `render.yaml` and the `Dockerfile`
+(`python -m reseau.front --dashboard`): Graph8 calls `/g8/<token>/…`, and every other path is the dashboard,
+behind a password. One process on one port, sharing one Gateway, keeps it within the free plan's hours. It needs a
+long-lived process: the SSE session lives in memory, so serverless hosts like Vercel can't run it.
 
-1. In Render, **New → Blueprint**, pick this repo, and fill in the values it asks for (the `.env` ones).
+1. In Render, **New → Blueprint**, pick this repo, and fill in the values it asks for: the `.env` ones, plus
+   `RESEAU_DASHBOARD_PASSWORD` (12+ characters; the dashboard won't start without it).
 2. Under the service's **Environment → Secret Files**, add `identities.json` and `projects.json` (Render
    mounts them at `/etc/secrets/`, where `render.yaml` points `RESEAU_IDENTITIES` and `RESEAU_PROJECTS`), then
    redeploy.
 3. Point the existing registration at it, locally (same `mcp_server_id`, so every workflow keeps working):
    `uv run python -m reseau.tunnel --url https://<service>.onrender.com`
-4. A free service sleeps after 15 minutes without requests and takes about a minute to wake, which Graph8's
+4. Open `https://<service>.onrender.com`: the browser asks for a user name (any) and the password.
+5. A free service sleeps after 15 minutes without requests and takes about a minute to wake, which Graph8's
    first call won't wait for. Keep it awake with a free pinger (cron-job.org, UptimeRobot) on
-   `https://<service>.onrender.com/ping` every 10 minutes. It answers `ok` (so does `/`; every other path
-   without the token is a 404); never put the token in the pinger's URL.
+   `https://<service>.onrender.com/ping` every 10 minutes. It answers `ok` without the password; never put the
+   token in the pinger's URL.
 
-Once deployed, run the dashboard alone (`uv run python -m reseau.dashboard`), not `./run.sh`: its tunnel
-would move the registration back to localhost.run.
+Once deployed, don't run `./run.sh`: its tunnel would move the registration back to localhost.run.
 
 ## Register with Graph8
 
