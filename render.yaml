@@ -1,0 +1,26 @@
+# Render Blueprint: the gateway on the free plan. Values marked sync: false are asked for when the Blueprint is
+# created; identities.json and projects.json are added as Secret Files, which Render mounts at /etc/secrets/.
+services:
+  - type: web
+    name: reseau-gateway
+    runtime: docker
+    plan: free
+    envVars:
+      - key: GITHUB_MCP_TOKEN
+        sync: false
+      - key: LINEAR_API_KEY
+        sync: false
+      - key: GRAPH8_API_KEY
+        sync: false
+      - key: RESEAU_GATEWAY_TOKEN
+        sync: false
+      - key: RESEAU_GITHUB_SCOPE
+        sync: false
+      - key: RESEAU_TEAM
+        sync: false
+      - key: RESEAU_TIMEZONE
+        sync: false
+      - key: RESEAU_IDENTITIES
+        value: /etc/secrets/identities.json
+      - key: RESEAU_PROJECTS
+        value: /etc/secrets/projects.json

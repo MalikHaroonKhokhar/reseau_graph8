@@ -67,3 +67,12 @@ def test_follow_retries_until_graph8_reaches_the_gateway():
     tests = [p for m, p, _ in g8.calls if p.endswith("/test")]
     assert len(tests) == 2 + 1 + 1  # two failures and a pass on the first host, one pass on the second
     assert g8.servers[0]["connection_url"] == "https://061d232cb1c235.lhr.life/g8/t/sse"
+
+
+def test_url_points_the_registration_at_a_fixed_host_once(monkeypatch):
+    monkeypatch.setenv("GRAPH8_API_KEY", "g8_live_test")
+    monkeypatch.setenv("RESEAU_GATEWAY_TOKEN", "t" * 22)
+    urls = []
+    monkeypatch.setattr(tunnel, "point", lambda g8, url: urls.append(url) or True)
+    assert tunnel.main(["--url", "https://reseau-gateway.onrender.com/"]) == 0
+    assert urls == ["https://reseau-gateway.onrender.com/g8/%s/sse" % ("t" * 22)]

@@ -132,8 +132,8 @@ set -a; . ./.env; set +a
 uv run python -m reseau.front --port 8080        # binds 127.0.0.1
 ```
 
-Réseau runs locally only; there is no deployed instance. Graph8 calls the gateway from its own servers, so
-it needs a public tunnel while it runs workflows. In a second shell:
+Graph8 calls the gateway from its own servers, so it must be public: deployed ([Deploy](#deploy-render)) or,
+run locally, behind a tunnel while it runs workflows. In a second shell:
 
 ```sh
 set -a; . ./.env; set +a
@@ -144,6 +144,26 @@ It opens a localhost.run tunnel and keeps the `reseau-gateway` registration poin
 moves to a new `*.lhr.life` host without warning, and a dropped connection ends it. The command reopens the
 tunnel, moves the same registration to each new host (so every workflow keeps working), and retries Graph8's
 `/test` until it passes. With no registration yet, it creates one.
+
+## Deploy (Render)
+
+The gateway runs on Render's free plan from `render.yaml` and the `Dockerfile` (the gateway only; the dashboard
+stays local). It needs a long-lived process: the SSE session lives in memory, so serverless hosts like Vercel
+can't run it.
+
+1. In Render, **New → Blueprint**, pick this repo, and fill in the values it asks for (the `.env` ones).
+2. Under the service's **Environment → Secret Files**, add `identities.json` and `projects.json` (Render
+   mounts them at `/etc/secrets/`, where `render.yaml` points `RESEAU_IDENTITIES` and `RESEAU_PROJECTS`), then
+   redeploy.
+3. Point the existing registration at it, locally (same `mcp_server_id`, so every workflow keeps working):
+   `uv run python -m reseau.tunnel --url https://<service>.onrender.com`
+4. A free service sleeps after 15 minutes without requests and takes about a minute to wake, which Graph8's
+   first call won't wait for. Keep it awake with a free pinger (cron-job.org, UptimeRobot) on
+   `https://<service>.onrender.com/ping` every 10 minutes. It answers 404, which still counts; never put the
+   token in the pinger's URL.
+
+Once deployed, run the dashboard alone (`uv run python -m reseau.dashboard`), not `./run.sh`: its tunnel
+would move the registration back to localhost.run.
 
 ## Register with Graph8
 
