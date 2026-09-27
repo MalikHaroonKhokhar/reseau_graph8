@@ -1,0 +1,32 @@
+{
+  "data": {
+    "id": 4242,
+    "name": "Example Customer Co",
+    "description": "Synthetic company for tests.",
+    "domain": "example.com",
+    "website": "https://example.com",
+    "logo_url": null,
+    "phone": "+1 555 0100",
+    "address": "1 Example Way",
+    "city": null,
+    "state": "CA",
+    "country": "US",
+    "zip": null,
+    "founded_year": null,
+    "employee_count": "11-50",
+    "revenue": "$1M-$10M",
+    "industry": "Software",
+    "industry_group": "Technology",
+    "linkedin_url": "https://www.linkedin.com/company/example",
+    "linkedin_followers": "100",
+    "facebook_url": null,
+    "twitter_url": null,
+    "crunchbase_url": null,
+    "meta_data": null,
+    "contact_count": 1,
+    "custom_fields": null,
+    "created_at": "2026-09-20T09:00:00Z",
+    "updated_at": null
+  },
+  "pagination": null
+}

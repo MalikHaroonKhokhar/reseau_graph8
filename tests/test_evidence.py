@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -8,11 +9,12 @@ import pytest
 from mcp.shared.exceptions import MCPError
 
 from reseau import evidence
+from reseau.semantic import TOOLS as SEMANTIC_TOOLS
 from reseau.evidence import github, linear
 from reseau.evidence.records import Actor, Record
-from reseau.gateway import Gateway, Upstream
-from tests.mock_upstream import FIXTURES, MockUpstream
-from tests.test_gateway import GH_TOKEN, LIN_TOKEN, run
+from reseau.gateway import DEFAULT_UPSTREAMS, Gateway, Upstream
+from tests.mock_upstream import FIXTURES, G8_COMPANY, G8_DEAL, G8_MEETING, G8_TASK, G8_THREAD, MockUpstream
+from tests.test_gateway import G8_TOKEN, GH_TOKEN, LIN_TOKEN, run
 
 AT = "2026-09-27T10:00:00+00:00"
 PR_ID = "github:pr:octo-dev/reseau_graph8#15"
@@ -21,7 +23,12 @@ COMMIT_ID = "github:commit:octo-dev/reseau_graph8@" + SHA
 COMMENT_ID = "github:review_comment:modelcontextprotocol/python-sdk#3583/4102813786"
 ISSUE_ID = "linear:issue:HAR-98"
 REVIEW_ID = "github:review:octo-dev/sandbox#13/4779069846"
-PEOPLE = {"dev": {"github": "octo-dev", "linear": "00000000-0000-4000-8000-000000000001"}}
+G8_OWNER = "7c3a9e51-2d84-4b6f-a0e3-91f5d2c8b476"  # the synthetic deal owner and task assignee
+CUSTOMER_ID, OPPORTUNITY_ID = "graph8:customer:%d" % G8_COMPANY, "graph8:opportunity:" + G8_DEAL
+COMMITMENT_ID, MEETING_ID = "graph8:commitment:" + G8_TASK, "graph8:conversation:meeting/" + G8_MEETING
+THREAD_ID = "graph8:conversation:email/" + G8_THREAD
+GRAPH8_IDS = [CUSTOMER_ID, OPPORTUNITY_ID, COMMITMENT_ID, MEETING_ID, THREAD_ID]
+PEOPLE = {"dev": {"github": "octo-dev", "linear": "00000000-0000-4000-8000-000000000001", "graph8": G8_OWNER}}
 
 
 def fixture(name):
@@ -83,15 +90,56 @@ def test_commit_without_linked_account_is_name_only():
     assert normalize(COMMIT_ID, c).actor == Actor("github", None, "octo-dev")
 
 
+# ---- Graph8 normalizers (HAR-108) against synthetic payloads in the live shapes ----
+
+def test_red_graph8_opportunity_fixture_produces_record():
+    assert normalize(OPPORTUNITY_ID, fixture("graph8_deal")) == Record(
+        OPPORTUNITY_ID, "graph8", "opportunity", G8_DEAL, None, "Example Customer Co - annual plan",
+        Actor("graph8", G8_OWNER, "Sam Owner"), "2026-09-21T10:00:00Z", "2026-09-25T16:30:00Z", AT)
+
+
+def test_graph8_customer_unwraps_the_company_record():
+    assert normalize(CUSTOMER_ID, fixture("graph8_company")) == Record(
+        CUSTOMER_ID, "graph8", "customer", "4242", None, "Example Customer Co", Actor("graph8", None),
+        "2026-09-20T09:00:00Z", None, AT)
+
+
+def test_graph8_commitment_is_a_task_linked_to_a_deal_or_company():
+    assert normalize(COMMITMENT_ID, fixture("graph8_task")) == Record(
+        COMMITMENT_ID, "graph8", "commitment", G8_TASK, None, "Ship SSO for Example Customer Co",
+        Actor("graph8", G8_OWNER, "Sam Owner"), "2026-09-22T08:00:00Z", "2026-09-24T12:00:00Z", AT)
+    unlinked = dict(fixture("graph8_task"), entity_type="team_member", entity_id=G8_OWNER, links=[
+        {"entity_type": "contact", "entity_id": "9001"}])
+    assert normalize(COMMITMENT_ID, unlinked) is None  # a task, but nothing ties it to a customer
+    assert normalize(COMMITMENT_ID, dict(unlinked, company_id=4242)) is not None
+
+
+def test_graph8_conversation_is_a_meeting_or_an_inbox_thread():
+    meeting, thread = normalize(MEETING_ID, fixture("graph8_meeting")), normalize(THREAD_ID, fixture("graph8_thread"))
+    assert (meeting.activity_id, meeting.kind, meeting.url, meeting.title, meeting.actor) == (
+        MEETING_ID, "conversation", None, "Example Customer Co - SSO requirements",
+        Actor("graph8", None, "owner@example.com"))
+    assert (thread.activity_id, thread.source_id, thread.title, thread.created_at) == (
+        THREAD_ID, G8_THREAD, "Re: SSO timeline", "2026-09-24T09:00:00Z")
+    kinds = evidence.SOURCES["graph8"]
+    fields = evidence.parse(THREAD_ID)[2]
+    assert (kinds["conversation"].tool(fields), kinds["conversation"].args(fields)) == (
+        "g8_get_reply", {"reply_id": G8_THREAD, "channel": "email"})
+
+
 # ---- activity_id ----
 
-@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, REVIEW_ID, ISSUE_ID])
+@pytest.mark.parametrize("aid", [PR_ID, COMMIT_ID, COMMENT_ID, REVIEW_ID, ISSUE_ID, *GRAPH8_IDS])
 def test_activity_id_round_trip(aid):
     assert evidence.format_id(*evidence.parse(aid)) == aid
 
 
 @pytest.mark.parametrize("aid", [None, 42, ["github:pr:o/r#9"], {"id": 1}, "", "github:pr:o/r", "github:pr:o/r#9x", "gitlab:pr:o/r#1", "github:issue:o/r#1",
-                                 "github:commit:" + SHA, "linear:issue:eng-1", "linear:issue:ENG-1 "])
+                                 "github:commit:" + SHA, "linear:issue:eng-1", "linear:issue:ENG-1 ",
+                                 # Graph8: an entity type HAR-107 didn't confirm, and malformed keys
+                                 "graph8:deal:" + G8_DEAL, "graph8:contact:9001", "graph8:customer:acme",
+                                 "graph8:opportunity:42", "graph8:commitment:" + G8_DEAL.upper(),
+                                 "graph8:conversation:" + G8_THREAD, "graph8:conversation:email/a/b"])
 def test_invalid_activity_id_is_structured(aid):
     with pytest.raises(MCPError) as e:
         evidence.parse(aid)
@@ -256,3 +304,61 @@ def test_red_unknown_id_is_structured_not_found(gateway_up, aid):
     err, health = run(go())
     assert (err.code, err.data) == (-32008, {"kind": "not_found", "activity_id": aid})
     assert all(h["ok"] for h in health.values())  # a missing record is not an upstream failure
+
+
+# ---- integration: gateway + mock Graph8 (HAR-108) ----
+
+def test_green_graph8_evidence_through_the_org_gate(caplog):
+    """The shipped Graph8 upstream (allowlist, hidden company getter, error-text guard) against a mock that fails
+    every tool with -32003 until g8_current_org is called."""
+    caplog.set_level(logging.DEBUG)
+    shipped = {u.name: u for u in DEFAULT_UPSTREAMS}["graph8"]
+
+    async def go():
+        with MockUpstream(G8_TOKEN, stateless=True, org_gate=True, evidence=True) as mock:
+            async with Gateway([dataclasses.replace(shipped, url=mock.url)], {"GRAPH8_API_KEY": G8_TOKEN},
+                               identities=PEOPLE) as gw:
+                names = {t.name for t in await gw.tools()}
+                found = {aid: (await gw.call("get_evidence", {"activity_id": aid})).structured_content
+                         for aid in GRAPH8_IDS}
+                missing = []
+                for aid in ("graph8:customer:1", "graph8:opportunity:" + G8_TASK, "graph8:commitment:" + G8_DEAL,
+                            "graph8:conversation:meeting/nope", "graph8:conversation:email/nope"):
+                    with pytest.raises(MCPError) as e:
+                        await gw.call("get_evidence", {"activity_id": aid})
+                    missing.append((e.value.code, e.value.data["kind"]))
+                raw_missing = await gw.call("g8_get_deal", {"deal_id": G8_TASK})
+                refused = []
+                for name, args in (("g8_crm_get_company", {"company_id": G8_COMPANY}), ("g8_create_deal", {"name": "x"})):
+                    with pytest.raises(MCPError) as e:
+                        await gw.call(name, args)
+                    refused.append(e.value.data["kind"])
+                return names, found, missing, raw_missing, refused, mock.org_calls, mock.created
+
+    names, found, missing, raw_missing, refused, org_calls, created = run(go())
+    assert names - {"get_evidence", *(t.name for t in SEMANTIC_TOOLS)} == {
+        "g8_current_org", "g8_get_deal", "g8_get_task", "g8_get_meeting", "g8_get_reply"}  # what the mock serves
+    customer = found[CUSTOMER_ID]
+    assert (customer["source"], customer["kind"], customer["url"], customer["title"]) == (
+        "graph8", "customer", None, "Example Customer Co")
+    assert datetime.fromisoformat(customer["fetched_at"]).tzinfo is not None
+    assert [r["activity_id"] for r in found.values()] == GRAPH8_IDS
+    assert found[OPPORTUNITY_ID]["actor"] == {"source": "graph8", "id": G8_OWNER, "name": "Sam Owner",
+                                              "person": "dev", "identity": "mapped"}
+    assert missing == [(-32008, "not_found")] * 5
+    assert raw_missing.is_error  # Graph8's "Error: ..." text with isError unset reaches clients as an error
+    assert refused == ["unknown_tool", "unknown_tool"] and created == 0  # hidden getter and writes: not routable
+    assert org_calls == 1
+    assert G8_TOKEN not in caplog.text
+    # Record bodies stay out of INFO and above; only the MCP SDK's own DEBUG traces carry message bodies
+    assert not [r for r in caplog.records if r.levelno >= logging.INFO and "Example Customer" in r.getMessage()]
+
+
+def test_graph8_allowlist_is_read_only():
+    """Every tool the gateway may call on Graph8 is one HAR-107 captured with readOnlyHint (discovery.json), or the
+    hidden company getter, which has no annotation to check."""
+    shipped = {u.name: u for u in DEFAULT_UPSTREAMS}["graph8"]
+    captured = json.loads((FIXTURES.parent.parent / "spikes/graph8_entities/discovery.json").read_text())
+    read_only = {name for name, hint in captured["visible_tools"] if hint}
+    assert shipped.allow <= read_only
+    assert shipped.internal == {"g8_crm_get_company"}

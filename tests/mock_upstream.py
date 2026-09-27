@@ -15,6 +15,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+# IDs of the synthetic Graph8 fixtures
+G8_COMPANY, G8_MEETING, G8_THREAD = 4242, "mtg_01J9EXAMPLE", "thr_01J9EXAMPLE"
+G8_DEAL, G8_TASK = "5f1c2b7e-8a44-4c1e-9d0b-2e6f3a9c7d10", "0b9e4d2a-3c71-4f58-8e16-7a2d5c4b9f31"
 
 
 def scripted_result(script, name, args):
@@ -100,10 +103,43 @@ class MockUpstream:
         def rpc_fail(text: str) -> str:
             raise MCPError(-32000, "upstream failed on " + text, {"input": text})
 
-        if evidence:  # GitHub and Linear read tools answering with the recorded fixtures, or their live not-found text
-            def fixture(name):
-                return (FIXTURES / (name + ".json")).read_text()
+        def fixture(name):
+            return (FIXTURES / (name + ".json")).read_text()
 
+        if evidence and org_gate:  # Graph8 read tools: gated like the rest, and a missing record answered the way the
+            # live server does (HAR-108 probe): an "Error: ..." text result with isError unset
+            @server.tool()
+            def g8_crm_get_company(company_id: int) -> str:
+                gate_check()
+                return fixture("graph8_company") if company_id == G8_COMPANY else "Error: g8_crm_get_company: Company not found"
+
+            @server.tool()
+            def g8_get_deal(deal_id: str) -> str:
+                gate_check()
+                return fixture("graph8_deal") if deal_id == G8_DEAL else "Error: Deal: Deal not found"
+
+            @server.tool()
+            def g8_get_task(task_id: str) -> str:
+                gate_check()
+                return fixture("graph8_task") if task_id == G8_TASK else "Task %s: Error: Task lookup: Task not found" % task_id
+
+            @server.tool()
+            def g8_get_meeting(meeting_id: str) -> str:
+                gate_check()
+                return fixture("graph8_meeting") if meeting_id == G8_MEETING else "Error: API error (400): Invalid meeting ID: " + meeting_id
+
+            @server.tool()
+            def g8_get_reply(reply_id: str, channel: str = "email") -> str:
+                gate_check()
+                return fixture("graph8_thread") if (reply_id, channel) == (G8_THREAD, "email") else \
+                    "Error: Inbox thread: Email %s not found" % reply_id
+
+            @server.tool()
+            def g8_create_deal(name: str) -> str:  # write tool, never allowlisted; created counts calls that got through
+                self.created += 1
+                return "created:" + name
+
+        elif evidence:  # GitHub and Linear read tools answering with the recorded fixtures, or their live not-found text
             @server.tool()
             def pull_request_read(method: str, owner: str, repo: str, pullNumber: int, perPage: int | None = None,
                                   after: str | None = None) -> str:

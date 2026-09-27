@@ -1,0 +1,30 @@
+{
+  "id": "thr_01J9EXAMPLE",
+  "channel": "email",
+  "subject": "Re: SSO timeline",
+  "status": "open",
+  "created_at": "2026-09-24T09:00:00Z",
+  "updated_at": "2026-09-24T11:00:00Z",
+  "assignees": [],
+  "tags": [],
+  "contact": {
+    "id": 9001,
+    "name": "Pat Buyer",
+    "email": "buyer@example.com"
+  },
+  "messages": [
+    {
+      "id": "msg_1",
+      "direction": "inbound",
+      "subject": "Re: SSO timeline",
+      "content": "When will SSO ship?",
+      "content_chars": 20,
+      "content_truncated": false,
+      "from_address": "buyer@example.com",
+      "to_addresses": [
+        "owner@example.com"
+      ],
+      "sent_at": "2026-09-24T09:00:00Z"
+    }
+  ]
+}
