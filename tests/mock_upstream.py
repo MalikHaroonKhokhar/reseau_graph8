@@ -53,6 +53,15 @@ class MockUpstream:
         def echo_struct(text: str) -> dict[str, str]:
             return {"text": text}
 
+        # Same raw names as GitHub and Linear both expose (FINDINGS.md Run 2); the reply says which mock answered.
+        @server.tool()
+        def list_issues() -> str:
+            return "list_issues@" + server.name
+
+        @server.tool()
+        def list_releases() -> str:
+            return "list_releases@" + server.name
+
         @server.tool()
         def rpc_fail(text: str) -> str:
             raise MCPError(-32000, "upstream failed on " + text, {"input": text})
