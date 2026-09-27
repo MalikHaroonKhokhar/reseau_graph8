@@ -3,9 +3,12 @@
 An MCP gateway that gives Graph8 agents access to GitHub, Linear and Graph8's own tools through a single
 registration.
 
-Graph8's MCP client can only register servers as legacy HTTP+SSE or stdio, with no header or auth field.
+Graph8's outbound MCP registration (`POST /api/v1/voice/mcp-servers`) accepts only legacy HTTP+SSE or stdio.
+A remote (`sse`) registration has no credential field at all, so Graph8 cannot present a bearer token to it; a
+`stdio` registration can carry secrets in `env_vars`, but the read route echoes them to any org-key holder.
 GitHub and Linear serve Streamable HTTP and need `Authorization: Bearer`, so Graph8 can't reach them directly
-(`test_connection/FINDINGS.md`). Réseau sits in between:
+(`test_connection/FINDINGS.md`). Graph8's own inbound MCP server is OAuth over Streamable HTTP and is
+unaffected — that is the endpoint Réseau consumes as an upstream. Réseau sits in between:
 
 ```
 Graph8 agent ──legacy SSE──▶ Réseau gateway ──Streamable HTTP + Bearer──▶ GitHub  /mcp/readonly

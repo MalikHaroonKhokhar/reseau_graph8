@@ -42,7 +42,7 @@ No tool-name collisions between GitHub's 45 names and Linear's ~80. **(Wrong —
 ## Blocked / not yet tested
 1. Graph8's own MCP client and a single Graph8 agent request holding both servers — needs `GRAPH8_API_URL`, `GRAPH8_API_KEY`, and the server-registration format.
 2. Linear over a raw bearer token from this client.
-3. Behaviour under concurrency, long sessions, and OAuth token refresh.
+3. Behaviour under concurrency, long sessions, and OAuth token refresh. **Measured in Run 5 (HAR-99). OAuth refresh does not apply: Réseau uses static keys.**
 
 ## Transport claim — "Graph8 accepts SSE/stdio; modern servers like Linear expose Streamable HTTP"
 
@@ -99,6 +99,7 @@ Every server ships Streamable HTTP. Legacy SSE lingers on some, but Linear and S
 | `uvx` | `[Errno 2] No such file or directory: 'uvx'` | **absent** |
 | `python3` | `unhandled errors in a TaskGroup` (process ran, handshake failed as designed) | **present** |
 | `sh` | `unhandled errors in a TaskGroup` | **present** |
+| `bash` | same (verified in `spikes/claims_check`) | **present** |
 
 So the spawn host is a Python image with no Node and no uv. `mcp-remote` (Node) cannot run there. Two follow-ups on the Python route:
 
@@ -274,3 +275,181 @@ The default config uses read-only endpoints for GitHub and Linear. Graph8 has no
 | Graph8 | `/mcp/` | 126 | 1: `g8_current_org` |
 
 Live smoke (`python -m reseau.gateway`): all three connect and return 7/6/1 tools. `get_me`, `list_teams` and `g8_current_org` all return OK. **230 → 14 tools** per agent request. A call to a tool not on the allowlist gets `-32007 tool_not_allowed` and is never sent upstream.
+
+---
+
+# Run 5 — concurrency, rate limits and long sessions (HAR-99, 2026-09-27)
+
+Probe: `spikes/concurrency/probe.py` (re-runnable; `selftest` needs no network). Read-only, allowlisted calls only:
+GitHub `get_me` on `/mcp/readonly`, Linear `list_teams` on `/mcp/readonly`. Two views of every call:
+
+- **raw**: one Streamable HTTP session per upstream through `outbound.http_transport`. It uses the gateway's UA, headers
+  and endpoints, but has **no retry and no per-host cap**, so upstream status codes and content types show as sent.
+- **gateway**: `reseau.gateway.Gateway` with its real policy (`MAX_PER_HOST = 2`, backoff). This is what an agent turn sees.
+
+Modes: `load` (one burst of N parallel calls per level), `sustain` (fixed concurrency until the first failure, then
+poll every 5 s until recovery), `long` (a gateway held open for hours, with one call per upstream per tick in each view).
+Raw results are gitignored. Records hold no token, no `Authorization` header and no raw `Mcp-Session-Id`: session ids are
+stored as an 8-char sha256 prefix, and error bodies go through `gateway.redact`.
+
+**OAuth refresh is not applicable.** Réseau authenticates with a static GitHub PAT and a static Linear API key, so
+there is no token to refresh. It was not tested.
+
+## Thresholds
+
+| upstream | burst (raw, one-shot N) | sustained (raw) | throttle response | recovery |
+|---|---|---|---|---|
+| GitHub | clean at **N = 128**; **429 at N = 256** (21 ok, 235 × 429) | clean at concurrency 4 (**600 calls, ~4.9 req/s**); 429 after **148 calls in 8.7 s at concurrency 16** (~17 req/s) | **HTTP 429 `text/plain` "too many requests", `Retry-After: 9–18`** | matches `Retry-After` (17.3 s after a `Retry-After: 18`) |
+| Linear | clean at **N = 256** (not reached) | fails on a rate budget, not on concurrency: 146 serial calls in 229 s (~0.64/s, after a 10-min cool-down) → 401; roughly 1,200 calls in ~15 min from a cold key | **HTTP 401 `application/json` `{"error":"invalid_token","error_description":"Invalid access token"}`**, no `Retry-After` | ~6 s (6.2 s and 6.3 s measured) |
+
+Neither upstream ever returned an HTML or Cloudflare challenge. That behaviour is specific to `be.graph8.com`
+("Cloudflare throttling and UA banning", about 6 parallel calls → 429 HTML).
+
+**Linear's throttle looks like an auth failure.** Once the key's budget is spent, Linear answers **401
+`invalid_token`** for a valid key, and a few seconds later the same key works again. Concurrency does not trigger it:
+it fired at concurrency 1 as well. It behaves like a continuously refilling request budget; Linear's exact
+per-tool-call cost was not measured. The gateway's `classify` maps any 401 to `unauthorized` and `_use` then **closes
+the session**, so a single throttled reply takes Linear down until `reconnect()`. Seen live: gateway burst N = 256 →
+169 ok, then **87 × `-32002 unauthorized (HTTP 401)`**.
+
+## Latency
+
+Raw p50 does not change with N below the threshold: GitHub **~0.84 s** from N = 1 to N = 128; Linear **~1.3–1.5 s** up
+to N = 64, and ~2.1–2.6 s at N = 128–256. Through the gateway, the cap of 2 queues a fan-out, so p50 grows about
+linearly with N:
+
+| N | GitHub raw p50 / gateway p50 / gateway max | Linear raw p50 / gateway p50 / gateway max |
+|---|---|---|
+| 1 | 0.85 / 0.82 / 0.82 s | 1.35 / 1.80 / 1.80 s |
+| 4 | 0.85 / 1.65 / 1.71 s | 1.57 / 2.46 / 2.47 s |
+| 8 | 0.85 / 2.42 / 3.24 s | 1.32 / 3.72 / 5.04 s |
+| 16 | 0.84 / 4.12 / 6.63 s | 1.33 / 6.99 / 10.9 s |
+| 64 | 0.84 / 14.0 / 26.4 s | 1.55 / 22.8 / 45.8 s |
+| 256 | 1.40 (429s) / 53.4 / 106 s, **all ok** | 2.64 / 107 / 141 s, 87 × unauthorized |
+
+The cap does its job: at N = 256 the raw burst drew 235 × 429 from GitHub, and the gateway got 256/256 through.
+The price is 1–2 s of queueing for a typical 4–8-call agent turn. One outlier each: Linear took 8.5 s (raw) and
+24.7 s (gateway) on an N = 2 burst. Linear sometimes stalls a single reply, so `READ_TIMEOUT = 60` must stay well
+above 25 s.
+
+## Long sessions
+
+_Pending: the 6-hour `long` run is still in progress. This section gets its results._
+
+## Recommendations for the HTTP layer (HAR-90)
+
+| setting | today | recommended | why |
+|---|---|---|---|
+| per-host cap | `MAX_PER_HOST = 2`, every host | per-host: **`api.githubcopilot.com` 8, `mcp.linear.app` 4, `be.graph8.com` 2** | GitHub: 8 × ~0.85 s ≈ 9 req/s, about half the ~17 req/s rate that drew 429s. That turns an 8-call fan-out from 2.4 s into ~0.85 s. Linear's limit is a budget that concurrency doesn't change; 4 cuts queueing without spending the budget faster than an agent's turns already do. Graph8: its edge challenges ~6 parallel calls, so keep 2. |
+| `RETRY_AFTER_CAP` | 30 s | keep | GitHub's `Retry-After` was 9–18 s; 30 s honours it. |
+| `MAX_ATTEMPTS`, `BACKOFF_BASE`, `BACKOFF_CAP` | 4, 0.5 s, 8 s | keep for 429 + `Retry-After`; add a **fixed ~7 s wait for Linear's throttle 401** (one retry) | Full-jitter backoff at these values rarely waits ≥ 6 s, which is Linear's measured recovery, and Linear sends no `Retry-After`. |
+| retry of `tools/call` on 429 | never | **retry on 429 only** (never on 5xx), for allowlisted read-only tools | A 429 is refused before it runs, so a repeat can't double-apply. Every tool the gateway exposes is read-only (Run 4). |
+| Linear 401 handling | `unauthorized`, session closed | a 401 **after a success on the same connection** = `rate_limited`: wait, retry once, keep the session. Treat a 401 as a bad credential only at initialize or when it persists. | A real bad key fails at initialize; mid-session 401s from a key that has worked are throttles. |
+| `READ_TIMEOUT` | 60 s | keep | The slowest single reply seen was 24.7 s (Linear). |
+
+## Follow-up tickets
+
+- **HAR-112**: Linear throttle 401 is misclassified as `unauthorized` and closes the upstream session (bug, from this run).
+- **HAR-113**: Per-host concurrency cap values and 429 retry for read-only `tools/call` (tuning of HAR-90).
+
+---
+
+# Run 6 — does the outbound `sse` client authenticate upstream? (2026-09-27)
+
+Closes the gap a missing field alone cannot close: whether Graph8's `sse` client performs OAuth against an upstream that challenges it. Four legacy-SSE endpoints registered as `transport_type: "sse"`, `/test` called, each deleted (final `GET /workflows/mcp-servers` → `{"servers":[],"total":0}`).
+
+| upstream `/sse` | upstream auth | `/test` | time |
+|---|---|---|---|
+| CoinGecko `mcp.api.coingecko.com/sse` | none | `success: true, tools_count: 2` — "Connection successful" | 2.0 s |
+| Atlassian `mcp.atlassian.com/v1/sse` | 401 + OAuth challenge | `success: false, tools_count: null` | 0.8 s |
+| Notion `mcp.notion.com/sse` | 401 + OAuth challenge | `success: false, tools_count: null` | 0.8 s |
+| Asana `mcp.asana.com/sse` | 401 + OAuth challenge | `success: false, tools_count: null` | 1.1 s |
+
+Same client, same transport, one variable: the control needs no credential and connects; all three that demand one fail in under ~1 s (too fast for an authorize round trip). **Graph8's outbound `sse` client performs no OAuth and presents no credential.** Together with the documented contract — "`transport_type` … is closed to those two here", body fields `{args, command, connection_url, description, enabled, env_vars, name, transport_type}` — and the full outbound operation list (connect / update / disconnect / test / live tools / cached tools / list, no authorize or callback route), an authenticated remote upstream has no supported path.
+
+Note on the docs: `BearerAuth` on those operation pages is the **caller's** Graph8 key authenticating to `be.graph8.com`. The same line appears on unrelated operations such as `list_contacts`, and `/developers/authentication/` documents API keys only. It is not a credential Graph8 forwards upstream.
+
+Source: [Connect an MCP server](https://docs.graph8.com/developers/api-reference/operations/create_mcp_server_voice_mcp_servers_post/), which also states `env_vars` "is write-only by convention on this surface — the read routes return the server's tools, not its environment". Run 3 disproved that guarantee (HAR-96).
+
+## Run 6b — is an undocumented `headers` field honoured? (2026-09-27)
+
+Registered `be.graph8.com/mcp/sse` (401 without a token, negotiates 2024-11-05 with one) three ways, `/test` each, all deleted:
+
+| case | registration | `/test` |
+|---|---|---|
+| A | `+ headers: {"Authorization": "Bearer <g8 key>"}` | `success: false` — `unhandled errors in a TaskGroup` |
+| B | control, no headers | `success: false` — identical message |
+| C | credential as `?api_key=` on `connection_url` | `success: false` — identical message |
+
+In all three the stored record contained **no** `headers`/`auth`/`bearer_token` key: extra fields are accepted with 201 and silently discarded (same as the earlier `headers`/`auth`/`oauth_client_id`/`bearer_token` probe). A == B, so `headers` changes nothing observable.
+
+**Limit of this test:** `/mcp/sse` answers a POST `initialize` with `text/event-stream` and never emits an `event: endpoint` on GET, so it is the Streamable-HTTP handler on a path, not a legacy-SSE endpoint. Transport alone can explain all three failures, so this does not isolate the header question — it only shows the field is unstored and inert.
+
+**The clean positive control is the Réseau gateway itself**, which is real legacy SSE (like CoinGecko, which emits `event: endpoint` and connects: `success: true, tools_count: 2`). Once it is publicly reachable: `/g8/<token>/sse` should connect (credential in the path) while the same URL without the path token, with the credential supplied only via `headers`, should fail. That pair settles it definitively.
+
+## Run 6c — transport isolated on one server (2026-09-27)
+
+`mcp.api.coingecko.com` exposes both transports with no auth on either: `/sse` is legacy HTTP+SSE (GET emits `event: endpoint`) and `/mcp` is Streamable HTTP (POST `initialize` → 200, protocol 2025-06-18; GET → 404). Registered both as `transport_type: "sse"`, `/test` each, both deleted.
+
+| `connection_url` | transport | `/test` |
+|---|---|---|
+| `…coingecko.com/sse` | legacy HTTP+SSE | **`success: true, tools_count: 2`** — "Connection successful", 2.5 s |
+| `…coingecko.com/mcp` | Streamable HTTP | `success: false, tools_count: null` — `TaskGroup`, 1.0 s |
+
+Same host, same tool surface, same (absent) credentials, same client, same user-agent. The only variable is the transport and it decides the outcome. This removes the objection that Run 1's Streamable-HTTP failure (MS Learn) could have had a server-specific cause: here the very same server succeeds on its legacy path.
+
+**Graph8's outbound `sse` is the deprecated 2024-11-05 HTTP+SSE transport.** Combined with Run 5 (auth) and the contract (no credential field), the three blockers are each isolated by a controlled test.
+
+## Run 6d — the transport enum is enforced server-side, and the gateway is green (2026-09-27)
+
+Five spellings of a Streamable-HTTP transport value, all rejected by Graph8's own validator:
+
+```
+transport_type = streamable_http | streamable-http | http | streamableHttp | STREAMABLE_HTTP
+  -> 422 {"type":"literal_error","loc":["body","transport_type"],"msg":"Input should be 'sse' or 'stdio'"}
+```
+
+So the closed enum is enforced, not merely documented. There is no undocumented Streamable-HTTP option, and Run 5c already ruled out auto-negotiation (a spec-compliant client POSTs `initialize` first and falls back on 4xx; Graph8's fails on `…/mcp` in 1.0 s while succeeding on the same server's `/sse`).
+
+**End to end, the same day:** the Réseau gateway, served over legacy HTTP+SSE through a tunnel, registered as `transport_type: "sse"`:
+
+- `POST /{id}/test` → `success: true, tools_count: 14` (16.1 s warm; a cold first call hit Cloudflare's ~16 s cutoff as a 502)
+- `GET /{id}/tools` → 7 `github_*`, 6 `linear_*`, 1 `g8_current_org` — the `list_issues` / `list_releases` collision resolved by prefixing
+- the stored record now carries `cached_tools` with full input schemas and `last_connected_at`
+- workflow `2c21f971-9ceb-4433-bc15-63fa3fa9cc4e` (`trigger → github_list_pull_requests → linear_list_issues`) ran `completed`, returning PR #14 and issue HAR-90 — real data from both upstreams through one registration
+
+The listing echoes `connection_url` with the gateway token in plaintext (HAR-96 again), which is why that token is gateway-scoped and rotatable.
+
+## Run 6e — the connector OAuth set does not include GitHub or Linear (2026-09-27)
+
+Graph8 does hold outbound OAuth credentials for a fixed provider set, through a hosted flow (`POST /api/v1/integrations/connections/session-token`, whose docs describe `provider_config_key` as "the key in the connection provider's own config" — a Nango-style hosted OAuth). Minting a session token per provider, identical call shape each time:
+
+| provider | result |
+|---|---|
+| `hubspot` | **200**, token (86 chars), `expires_at` ≈ 15 min |
+| `salesforce` | **200**, token |
+| `github` | **500** `server_error` |
+| `linear` | **500** `server_error` |
+| `jira` | **500** `server_error` |
+
+`GET /api/v1/integrations/connections` → `{"items": [], "connections": []}` for this org, and there is no provider-catalog route (`/integrations/providers` → 404).
+
+So the connector layer is CRM-shaped and GitHub/Linear have no working connector in it. Two honest caveats: a 500 is an unhandled error rather than a declared "unsupported", so this shows no working connector exists, not the internal reason (an unknown provider key returning 500 instead of a 4xx is itself worth reporting); and the marketing integrations page lists GitHub and Linear under 500+ **data-pipeline sources**, which is a different system (ELT into the CDP) from this connections flow.
+
+**This does not reach MCP either way.** The connection layer's routes are `/integrations/crm/connections/{id}/contacts|companies|deals|leads` — record sync — while `POST /voice/mcp-servers` accepts `{name, description, enabled, transport_type, connection_url, command, args, env_vars}` with no field that can reference a `connection_id`. A connected HubSpot cannot lend its credential to an MCP registration, let alone an unconnected GitHub.
+
+## Run 6f — verification pass, and two corrections (`spikes/claims_check/verify_claims.py`, 2026-09-27)
+
+Every claim above was re-run live. Ten held as written; two were wrong and two need tighter wording.
+
+**Corrected — the stdio runtime.** "Only `python3` and `sh`" is wrong: **`bash` is present too**. What is actually absent is `npx`, `uvx`, `node` and `mcp-proxy` (and `import mcp_proxy` fails). The accurate phrasing is **"no Node or uv tooling at all"**, not a two-binary allowlist.
+
+**Corrected — "never for an arbitrary MCP server".** Overstated. `env_vars` stores secrets for **any** stdio registration, and Run 3's own bridge authenticated exactly that way (`UPSTREAM_TOKEN`). The accurate claim is narrower and still sufficient: **a remote (`sse`) registration has no credential field at all**; a `stdio` one can carry secrets, at the cost of shipping them into a store the read route echoes in plaintext (HAR-96).
+
+**Tightened — the auth timings.** Re-measured, the OAuth-guarded `/sse` failures were 0.68 s, 0.76 s and **1.22 s** (Atlassian), so "under 1.1 s" does not hold across runs. Timing is corroborating evidence at best; the primary argument is the absent credential field, and the verification confirmed all three routes are live and OAuth-guarded (401 + Bearer challenge) rather than missing.
+
+**Tightened — the tool-count arithmetic.** 45 + 59 + 126 = 230 raw, but the gateway reads the read-only endpoints first (27 + 35 + 126 = **188**) and the allowlist cuts that to 14. Quote it as "188 → 14 after allowlisting, from 230 raw" rather than "230 → 14".
+
+**Provenance note:** the "It is closed to those two here" sentence is the OpenAPI description for `POST /voice/mcp-servers` (`be.graph8.com/api/v1/openapi.json`); it reaches readers through the rendered operation page at `docs.graph8.com/developers/api-reference/operations/create_mcp_server_voice_mcp_servers_post/`, which is where it was first read here.
+
+**Also confirmed independently:** the 422 enum (five spellings), the CoinGecko same-host A/B (both paths serve the identical two tools, `execute` and `search_docs`, with no auth), the silently-discarded canary fields, GitHub and Linear both 401-with-Bearer-challenge on Streamable HTTP with Linear's `/sse` at 404, and the inbound protected-resource metadata pointing at `auth.graph8.com/oauth/2.1`.

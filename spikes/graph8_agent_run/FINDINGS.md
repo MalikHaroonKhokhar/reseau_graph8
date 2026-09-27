@@ -61,3 +61,23 @@ Traps. None of these are in the SDK types; they were found with the validator an
 ## Other observations
 - `GET /voice/mcp-servers/{uuid}/tools` now returns 200 with the live tool list (it returned 502 in the earlier spike). `GET .../tools/cached` returns 404 for a uuid that exists.
 - Voice agents are listed by `agent_name` at the top level of `GET /voice/agents`, and deleted by `agent_id` uuid. Workflows are deleted by `action_id`.
+
+## Addendum (2026-09-27): mixed interpolation does not resolve — use a `run_javascript` merge
+
+`${node.field}` resolves only when it is the **entire** `source_expression`. A string with placeholders embedded in literal text is passed through verbatim: an `agent` node mapped with `"GitHub pull requests: ${gh_1.content}\n\nLinear issues: ${lin_1.content}"` received the raw text, and the model said so — *"Looks like the template variables weren't substituted — `${gh_1.content}` and `${lin_1.content}` came through as raw placeholders."* This is the constraint that matters when an agent node needs **two** upstream outputs, since `message` is a single field.
+
+Fix, which also keeps the prompt small: a `run_javascript` node between the tools and the agent. Its `input_mappings` bind bare refs to `vars.<name>`, and its return value is reachable as a bare `${node.result}`:
+
+```json
+{"node_id": "merge_1", "node_type": "run_javascript", "connections": ["agent_1"],
+ "config": {"timeout_ms": 5000,
+   "code": "const cut=(s,n)=>String(s==null?'':s).slice(0,n); return 'GitHub pull requests:\n'+cut(vars.gh,2000)+'\n\nLinear issues:\n'+cut(vars.lin,2000);",
+   "input_mappings": [{"source_expression": "${gh_1.content}", "target_field": "gh"},
+                      {"source_expression": "${lin_1.content}", "target_field": "lin"}]}}
+```
+
+`GET /workflows/node-types/schema` lists 67 node types; `transform` and `run_javascript` are the two that can join branches.
+
+**Demo run, green end to end** (`action_id 39682a7e-3e95-4c86-a399-14597316d7ec`, 25.8 s, all nodes `completed`): `trigger → github_list_pull_requests → linear_list_issues → merge_1 → agent_1`, every tool call routed through the registered `reseau-gateway`. The agent returned: *"PR #14 landed a README wording fix … HAR-90 … is done; HAR-99 … is still open."* — correct PR number, correct issue ids, correct statuses, and no persona greeting (the voice agent `73e0c4a9-…` is created with `conciseness_level 0.9` and an explicit "no greetings, no sign-offs" persona).
+
+**Tunnel caveat:** free `localhost.run` tunnels drop without warning. When that happened mid-run, `gh_1` failed in 1.9 s with the usual `TaskGroup` message while the public URL returned 503. Recovery is `PUT /api/v1/voice/mcp-servers/{id}` with the new `connection_url` — the `mcp_server_id` is unchanged, so existing workflows keep working.
