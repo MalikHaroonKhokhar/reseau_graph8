@@ -291,3 +291,6 @@ creates them and deletes them afterwards, unless `--keep`. It is billable (~150 
 | `run.sh` | Starts the gateway, the tunnel and the dashboard together |
 | `test_connection/`, `spikes/` | Findings from probing Graph8, GitHub and Linear that the design is based on |
 | `upstream/` | Fixes proposed to Graph8, handed off as tickets (tests: `uv run pytest upstream/<name>`) |
+
+> ⚠️ **Run this project locally.**  
+> The production server has been deleted and is no longer available.
